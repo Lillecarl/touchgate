@@ -6,6 +6,7 @@
   touchgate,
   vaultwarden,
   bitwarden-cli,
+  openssh,
   ruff,
   pyrefly,
   nixfmt,
@@ -34,6 +35,12 @@ let
     ]
   );
 
+  # OpenSSH's signature vectors, made by OpenSSH with its test security keys.
+  sshsigVectors = runCommand "sshsig-vectors" { } ''
+    tar -xf ${openssh.src}
+    cp -r */regress/unittests/sshsig/testdata $out
+  '';
+
   # Narrows a run while iterating: `TOUCHGATE_TESTS=tests/test_x.py nix build --impure --file . checks.tests`.
   selected = builtins.getEnv "TOUCHGATE_TESTS";
 in
@@ -55,6 +62,7 @@ in
       ''
         cp -r ${pythonSources} src && chmod -R +w src && cd src
         export HOME=$TMPDIR
+        export TOUCHGATE_SSHSIG_VECTORS=${sshsigVectors}
         # httpx2 builds a TLS context even for http://, and the sandbox has no CA file.
         export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt
         python -m pytest -p no:cacheprovider --import-mode=importlib -v ${
