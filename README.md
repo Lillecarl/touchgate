@@ -62,6 +62,24 @@ grants a secret.
 - **WebAuthn:** the broker serves an approval page; the person opens it
   and touches the key in the browser. Works without pymux.
 
+## Unlocking
+
+The broker starts locked. Three ways open it:
+
+- `touchgate unlock` asks for the master password.
+- A systemd credential `touchgate-password` unlocks it at start. Read
+  the limits below first.
+- A security key with the FIDO2 PRF (hmac-secret), such as a YubiKey.
+  The key's PRF gives the same 32 bytes on every touch, and those seal
+  the master password. This runs where the key is plugged in:
+
+      touchgate enroll    # two touches; writes ~/.config/touchgate/sealed-password.json
+      ssh -N -L /tmp/touchgate.sock:/run/user/1000/touchgate/broker.sock dynhetz &
+      TOUCHGATE_SOCKET=/tmp/touchgate.sock touchgate unlock --yubikey
+
+  The sealed file opens only with that key, touched. The password
+  crosses the SSH link to the broker.
+
 ## Configuration
 
 `~/.config/touchgate/config.toml`:

@@ -22,6 +22,8 @@ CREDENTIAL = "touchgate-password"
 
 SERVERS = {"us": BITWARDEN_US, "eu": BITWARDEN_EU}
 
+SOCKET_VARIABLE = "TOUCHGATE_SOCKET"
+
 
 class ConfigError(Exception):
     pass
@@ -66,7 +68,16 @@ def load(environ: Mapping[str, str] = os.environ) -> Config:
         raise ConfigError("no configuration at %s" % path) from None
 
 
+def sealed_file(environ: Mapping[str, str] = os.environ) -> Path:
+    "The master password sealed to a security key, on the machine the key is plugged into."
+    return config_file(environ).with_name("sealed-password.json")
+
+
 def socket_path(environ: Mapping[str, str] = os.environ) -> Path:
+    "`$TOUCHGATE_SOCKET` names another, such as one SSH forwards from the broker's machine."
+    override = environ.get(SOCKET_VARIABLE)
+    if override:
+        return Path(override)
     runtime = environ.get("XDG_RUNTIME_DIR")
     if not runtime:
         raise ConfigError("XDG_RUNTIME_DIR is not set, so the broker has nowhere private to listen")

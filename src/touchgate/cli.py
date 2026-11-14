@@ -1,7 +1,8 @@
 """
 `touchgate broker` runs the service. `unlock`, `lock` and `status` talk
 to it over its socket. `run` asks it for a secret and runs a command
-with it, once a security key signs the request.
+with it, once a security key signs the request. `enroll` seals the
+master password to a security key, which `unlock --yubikey` then opens.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from . import config
 from .approval import ApprovalError
 from .broker import Broker, ask, not_dumpable
 from .client import approved_env, run_in_broker, ssh_sign
+from .sealed import Fido2Key, Sealed, SealError, seal, unseal, write
 
 
 async def _broker() -> int:
@@ -35,9 +37,27 @@ async def _broker() -> int:
     return 0
 
 
-async def _unlock() -> int:
-    password = await anyio.to_thread.run_sync(getpass.getpass, "Master password: ")
+async def _unlock(yubikey: bool) -> int:
+    if yubikey:
+        try:
+            sealed = Sealed.loads(await anyio.Path(config.sealed_file()).read_text())
+        except FileNotFoundError:
+            raise config.ConfigError("no sealed password at %s; run touchgate enroll" % config.sealed_file()) from None
+        password = await unseal(Fido2Key(_announce), sealed)
+    else:
+        password = await anyio.to_thread.run_sync(getpass.getpass, "Master password: ")
     return _report(await ask(config.socket_path(), {"op": "unlock", "password": password}))
+
+
+async def _enroll() -> int:
+    password = await anyio.to_thread.run_sync(getpass.getpass, "Master password: ")
+    if password != await anyio.to_thread.run_sync(getpass.getpass, "Again: "):
+        raise SealError("the two passwords differ")
+    # Two touches: one makes the credential, one derives the key from it.
+    path = config.sealed_file()
+    await write(path, await seal(Fido2Key(_announce), password))
+    print(path)
+    return 0
 
 
 def _announce(line: str) -> None:
@@ -98,7 +118,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="touchgate", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("broker", help="Run the broker, which holds the vault.")
-    commands.add_parser("unlock", help="Give the broker the master password.")
+    unlock = commands.add_parser("unlock", help="Give the broker the master password.")
+    unlock.add_argument("--yubikey", action="store_true", help="Open the password sealed by `enroll` with a touch.")
+    commands.add_parser("enroll", help="Seal the master password to the security key plugged in here.")
     commands.add_parser("lock", help="Make the broker forget the vault.")
     commands.add_parser("status", help="Say whether the broker holds the vault.")
     run = commands.add_parser("run", help="Run a command with a secret, once a security key approves.")
@@ -125,7 +147,9 @@ def main(argv: list[str] | None = None) -> int:
             case "broker":
                 return anyio.run(_broker)
             case "unlock":
-                return anyio.run(_unlock)
+                return anyio.run(_unlock, bool(args.yubikey))
+            case "enroll":
+                return anyio.run(_enroll)
             case "run":
                 program: list[str] = args.program[1:] if args.program[:1] == ["--"] else args.program
                 if not program:
@@ -133,6 +157,6 @@ def main(argv: list[str] | None = None) -> int:
                 return anyio.run(_run, str(args.secret), program, dict(args.env), bool(args.client_exec))
             case command:
                 return anyio.run(_simple, command)
-    except (config.ConfigError, ApprovalError, OSError) as error:
+    except (config.ConfigError, ApprovalError, SealError, OSError) as error:
         print("touchgate: %s" % error, file=sys.stderr)
         return 1

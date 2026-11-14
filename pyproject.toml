@@ -15,6 +15,8 @@ dependencies = [
   "argon2-cffi>=23.1",
   # AES-CBC, HMAC, HKDF, PBKDF2 and RSA-OAEP of the vault.
   "cryptography>=44",
+  # The security key that seals the master password, on the machine it is plugged into.
+  "fido2>=2.0",
   "httpx2",
   "pydantic>=2.11",
 ]

@@ -5,6 +5,7 @@
   anyio,
   argon2-cffi,
   cryptography,
+  fido2,
   httpx2,
   pydantic,
 }:
@@ -30,6 +31,7 @@ buildPythonPackage (finalAttrs: {
     anyio
     argon2-cffi
     cryptography
+    fido2
     httpx2
     pydantic
   ];
