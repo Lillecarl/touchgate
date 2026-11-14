@@ -54,6 +54,9 @@ async def vaultwarden(tmp_path_factory: pytest.TempPathFactory) -> AsyncIterator
         # The default login bucket is 10, and a suite logs in more often than that.
         "LOGIN_RATELIMIT_MAX_BURST": "1000",
         "LOGIN_RATELIMIT_SECONDS": "1",
+        # Registration counts here, and its default bucket of 50 is a few test modules.
+        "UNAUTHENTICATED_RATELIMIT_MAX_BURST": "1000",
+        "UNAUTHENTICATED_RATELIMIT_SECONDS": "1",
     }
     server = Server("https://localhost:%d" % port, trust, str(ca_file))
     async with await anyio.open_process(["vaultwarden"], env=environment) as process:
