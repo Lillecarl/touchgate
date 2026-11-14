@@ -30,6 +30,8 @@ packages = ["src/touchgate"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The helpers beside the tests. touchgate itself comes from the installed package.
+pythonpath = ["tests"]
 # Every async test and fixture runs on anyio, with no mark.
 anyio_mode = "auto"
 # A hang fails instead of waiting forever. A test's own deadline is lower.
@@ -42,6 +44,8 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 extend-select = ["I", "UP", "B", "TID"]
+# `%` formatting, as in Carl's other projects.
+ignore = ["UP031"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "asyncio".msg = "use anyio"

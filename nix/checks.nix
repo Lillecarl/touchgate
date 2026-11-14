@@ -16,6 +16,7 @@ let
     inherit root;
     fileset = lib.fileset.unions [
       ../pyproject.toml
+      ../pyrefly.toml
       (lib.fileset.fileFilter (file: file.hasExt "py") ../src)
       (lib.fileset.fileFilter (file: file.hasExt "py") ../tests)
     ];
@@ -65,11 +66,19 @@ in
     touch $out
   '';
 
-  pyrefly = runCommand "touchgate-pyrefly" { nativeBuildInputs = [ testEnv pyrefly ]; } ''
-    cp -r ${pythonSources} src && chmod -R +w src && cd src
-    pyrefly check --python-interpreter-path ${testEnv}/bin/python src tests
-    touch $out
-  '';
+  pyrefly =
+    runCommand "touchgate-pyrefly"
+      {
+        nativeBuildInputs = [
+          testEnv
+          pyrefly
+        ];
+      }
+      ''
+        cp -r ${pythonSources} src && chmod -R +w src && cd src
+        pyrefly check --python-interpreter-path ${testEnv}/bin/python
+        touch $out
+      '';
 
   nixfmt =
     runCommand "touchgate-nixfmt"

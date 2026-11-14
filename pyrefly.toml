@@ -1,0 +1,3 @@
+project-includes = ["src", "tests"]
+# The tests import their helpers as top-level modules, as pytest's `pythonpath` puts them.
+search-path = ["src", "tests"]

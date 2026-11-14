@@ -12,14 +12,21 @@ in
 }:
 let
   python = pkgs.python3;
-  touchgate = python.pkgs.callPackage ./nix/package.nix { };
+  module = python.pkgs.callPackage ./nix/package.nix { };
+  touchgate = python.pkgs.toPythonApplication module;
 in
 {
   inherit touchgate;
   default = touchgate;
 
-  shell = pkgs.callPackage ./nix/shell.nix { inherit touchgate python; };
+  shell = pkgs.callPackage ./nix/shell.nix {
+    inherit python;
+    touchgate = module;
+  };
   # callPackages, not callPackage: the latter adds `override` to the set.
-  checks = pkgs.callPackages ./nix/checks.nix { inherit touchgate python; };
+  checks = pkgs.callPackages ./nix/checks.nix {
+    inherit python;
+    touchgate = module;
+  };
   formatter = pkgs.nixfmt-tree;
 }

@@ -1,6 +1,6 @@
 {
   lib,
-  buildPythonApplication,
+  buildPythonPackage,
   hatchling,
   anyio,
   argon2-cffi,
@@ -8,7 +8,9 @@
   httpx2,
   pydantic,
 }:
-buildPythonApplication (finalAttrs: {
+# A package, not an application: `withPackages` drops an application, and
+# the tests import this one. default.nix makes the application of it.
+buildPythonPackage (finalAttrs: {
   pname = "touchgate";
   version = "0.1.0";
   pyproject = true;
