@@ -8,11 +8,12 @@ from __future__ import annotations
 import json
 import shlex
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import anyio
 
-from .approval import NAMESPACE, ApprovalError, ExecMode
+from .approval import ApprovalError, ExecMode, namespace_of
 from .broker import MAX_REQUEST, RELAYED, Lines, ask
 
 if TYPE_CHECKING:
@@ -26,7 +27,8 @@ type Signer = Callable[[bytes], Awaitable[str]] | None
 
 async def ssh_sign(key: Path, challenge: bytes) -> str:
     "Signs with `ssh-keygen`. A `.pub` key means the private half is in the agent."
-    command = ["ssh-keygen", "-Y", "sign", "-n", NAMESPACE, "-f", str(key)]
+    describe(challenge)  # refuses a challenge with fields this version cannot show
+    command = ["ssh-keygen", "-Y", "sign", "-n", namespace_of(challenge), "-f", str(key)]
     if key.suffix == ".pub":
         command.append("-U")
     # stderr stays on the terminal: ssh-keygen asks for the touch there.
@@ -34,6 +36,14 @@ async def ssh_sign(key: Path, challenge: bytes) -> str:
     if done.returncode != 0:
         raise ApprovalError("ssh-keygen could not sign (exit %d)" % done.returncode)
     return done.stdout.decode()
+
+
+@dataclass(frozen=True, slots=True)
+class Asked:
+    id: str
+    challenge: bytes
+    #: The grant the request runs under, with no touch; None when it waits for one.
+    grant: str | None
 
 
 async def request(
@@ -48,6 +58,23 @@ async def request(
     elsewhere: bool = False,
 ) -> tuple[str, bytes]:
     "Asks for `secret` for `argv`, and answers the request id and its challenge."
+    asked = await ask_for(socket, secret, argv, cwd=cwd, requester=requester, mode=mode, env=env, elsewhere=elsewhere)
+    return asked.id, asked.challenge
+
+
+async def ask_for(
+    socket: Path,
+    secret: str,
+    argv: list[str],
+    *,
+    cwd: str,
+    requester: str | None,
+    mode: ExecMode,
+    env: Mapping[str, str],
+    elsewhere: bool = False,
+    grant: Mapping[str, object] | None = None,
+) -> Asked:
+    "Asks for `secret` for `argv`, and for a grant with the terms in `grant`."
     reply = await ask(
         socket,
         {
@@ -59,11 +86,13 @@ async def request(
             "exec": mode,
             "env": dict(env),
             "elsewhere": elsewhere,
+            "grant": None if grant is None else dict(grant),
         },
     )
     if not reply.get("ok"):
         raise ApprovalError(str(reply.get("error")))
-    return str(reply["id"]), str(reply["challenge"]).encode()
+    granted = reply.get("grant")
+    return Asked(str(reply["id"]), str(reply["challenge"]).encode(), None if granted is None else str(granted))
 
 
 async def approved_env(
@@ -103,6 +132,7 @@ async def run_in_broker(
     environ: Mapping[str, str],
     announce: Callable[[str], None],
     stdio: tuple[int, int, int] = (0, 1, 2),
+    grant: Mapping[str, object] | None = None,
 ) -> int:
     """
     Once the key signs, the broker runs `argv` on this process's stdio,
@@ -111,11 +141,24 @@ async def run_in_broker(
     # The approve carries the environment. Too large, and the broker would refuse it after the touch.
     if len(json.dumps(dict(environ))) > MAX_REQUEST // 2:
         raise ApprovalError("the environment is over %d bytes, too large to pass to the broker" % (MAX_REQUEST // 2))
-    id, challenge = await request(
-        socket, secret, argv, cwd=cwd, requester=requester, mode=ExecMode.BROKER, env=env, elsewhere=sign is None
+    asked = await ask_for(
+        socket,
+        secret,
+        argv,
+        cwd=cwd,
+        requester=requester,
+        mode=ExecMode.BROKER,
+        env=env,
+        elsewhere=sign is None,
+        grant=grant,
     )
-    announce(describe(challenge, sign is None))
-    approve = {"op": "approve", "id": id, "signature": await _signature(sign, challenge), "environ": dict(environ)}
+    if asked.grant is None:
+        announce(describe(asked.challenge, sign is None))
+        signature = await _signature(sign, asked.challenge)
+    else:
+        announce("request %s runs under grant %s" % (asked.id, asked.grant))
+        signature = None
+    approve = {"op": "approve", "id": asked.id, "signature": signature, "environ": dict(environ)}
     async with await anyio.connect_unix(socket) as stream:
         await stream.send_fds(json.dumps(approve).encode() + b"\n", stdio)
         async with anyio.create_task_group() as tasks:
@@ -139,9 +182,18 @@ async def _signature(sign: Signer, challenge: bytes) -> str | None:
     return None if sign is None else await sign(challenge)
 
 
+#: Every field a challenge may hold. A signer refuses one with more: it cannot show the rest.
+KNOWN = frozenset(
+    {"touchgate", "id", "nonce", "expires", "secret", "item", "argv", "cwd", "requester", "exec", "variables", "grant"}
+)
+
+
 def describe(challenge: bytes, elsewhere: bool = False) -> str:
     "Everything the challenge holds, for the person about to sign it."
     fields = json.loads(challenge)
+    unknown = set(fields) - KNOWN
+    if unknown:
+        raise ApprovalError("a challenge with fields this touchgate cannot show: %s" % ", ".join(sorted(unknown)))
     variables = ", ".join("%s from %s" % pair for pair in fields["variables"].items()) or "none"
     starter = "the broker" if fields["exec"] == ExecMode.BROKER else "this client, which gets the values"
     where = "on the machine a linked pymux runs on" if elsewhere else ""
@@ -155,5 +207,34 @@ def describe(challenge: bytes, elsewhere: bool = False) -> str:
             "  variables  %s" % variables,
             "  requester  %s" % (fields["requester"] or "not in pymux"),
             "  expires    in %d seconds" % max(0, fields["expires"] - int(time.time())),
+            *_grant_lines(fields.get("grant"), fields["argv"]),
         ]
     )
+
+
+def _grant_lines(grant: dict[str, object] | None, argv: list[str]) -> list[str]:
+    if grant is None:
+        return []
+    anchor = grant["anchor"]
+    if not isinstance(anchor, dict):
+        raise ApprovalError("a grant with no anchor")
+    prefix = grant.get("prefix")
+    matched = (
+        "exactly this command"
+        if prefix is None
+        else "any command that starts %s" % shlex.join(argv[: int(str(prefix))])
+    )
+    uses = grant.get("uses")
+    return [
+        "and GRANTS, with no further touch:",
+        "  runs of    %s" % matched,
+        "  by         process %s (%s) in %s, and every process under it"
+        % (anchor["pid"], anchor["name"], anchor["cwd"]),
+        "  for        %s, or until that process exits" % _duration(int(str(grant["seconds"]))),
+        "  uses       %s" % ("no limit" if uses is None else uses),
+    ]
+
+
+def _duration(seconds: int) -> str:
+    hours, rest = divmod(seconds, 3600)
+    return "%dh%02dm" % (hours, rest // 60) if hours else "%dm%02ds" % divmod(rest, 60)

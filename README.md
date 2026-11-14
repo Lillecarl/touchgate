@@ -66,6 +66,39 @@ grants a secret.
   pymux link, and the broker verifies it on arrival. A machine with the
   key answers only a server its own pymux dialled.
 
+## Grants
+
+One touch can approve later runs too. An agent such as Claude Code
+then runs a deploy command again and again, with no touch each time:
+
+    touchgate run --grant 8h deploy -- ./deploy.sh prod
+
+The grant holds for one process and every process under it: the
+anchor. By default the anchor is the nearest Claude Code process above
+`touchgate`; `--grant-to PID` names another. The broker reads the
+anchor's name, directory and start time from `/proc` itself, and
+refuses an anchor that is not a parent of the process that asks, or
+that is a parent of the broker too. The challenge holds the grant
+terms, so the popup shows them before the touch.
+
+A later request runs under the grant with no touch when the anchor is
+one of its parents and the request names the same item, the same
+variables and the same command. `--grant-prefix N` matches only the
+first N words of the command. Only the broker starts a granted
+command; a grant takes no `--client-exec`.
+
+A grant ends at its time limit (at most 24 hours), after
+`--grant-uses N` runs, when the anchor exits, when the broker locks,
+or on `touchgate revoke ID` (`--all` ends every grant).
+`touchgate grants` lists them as JSON. The watch reports each run
+under a grant as a `run` event.
+
+A grant challenge is signed under its own SSHSIG namespace,
+`touchgate-grant`. A touchgate without grants shows such a challenge as
+one plain run and signs it under `touchgate`, and the broker refuses
+that signature. A touchgate refuses to sign a challenge with fields it
+cannot show.
+
 ## Unlocking
 
 The broker starts locked. Three ways open it:
@@ -132,6 +165,12 @@ in. The pymux link between them needs pymux with plugin messages
 - The environment and working directory of a broker run are the
   client's. The broker drops `LD_*` and `DYLD_*`, but a variable or a
   file in the directory can still steer the command.
+- A grant narrows; it is no sandbox. Every process of the user that
+  can ptrace the anchor can start a child under it, and that child
+  runs under the grant. A grant also trusts the pid that `SO_PEERCRED`
+  records at connect: a process that exits, and gives its pid to a new
+  process before the broker reads `/proc`, is mistaken for the new one.
+  Grants need `/proc`, so they work only on Linux.
 - A security key has no display. A touch approves whichever signature
   request reaches the key first.
 - Everything here runs as one user. A process that can replace the

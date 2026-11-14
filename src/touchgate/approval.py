@@ -31,6 +31,9 @@ log = logging.getLogger(__name__)
 
 #: The SSHSIG namespace: a signature for git or for a file never approves a run.
 NAMESPACE = "touchgate"
+#: The namespace for a challenge that also asks for a grant. A signer that cannot show a
+#: grant signs under NAMESPACE, and the broker refuses that signature for a grant.
+GRANT_NAMESPACE = "touchgate-grant"
 #: The vault item whose notes list the approver keys, one OpenSSH public key per line.
 #: It lives in the vault because a local agent cannot write there.
 APPROVERS_ITEM = "touchgate-approvers"
@@ -121,6 +124,54 @@ def _value(item: Item, source: str) -> Secret:
 
 
 @dataclass(frozen=True, slots=True)
+class Anchor:
+    "The process a grant holds for, and every process under it. The broker reads each fact from /proc."
+
+    pid: int
+    start: int
+    name: str
+    cwd: str
+
+
+@dataclass(frozen=True, slots=True)
+class GrantTerms:
+    "What one touch approves beyond the run it signs."
+
+    seconds: int
+    #: Runs the grant allows. None: any number, until it ends otherwise.
+    uses: int | None
+    #: How many argv words a run must match. None: the whole argv.
+    prefix: int | None
+    anchor: Anchor
+
+    def described(self) -> dict[str, object]:
+        return {
+            "seconds": self.seconds,
+            "uses": self.uses,
+            "prefix": self.prefix,
+            "anchor": {
+                "pid": self.anchor.pid,
+                "start": self.anchor.start,
+                "name": self.anchor.name,
+                "cwd": self.anchor.cwd,
+            },
+        }
+
+
+def namespace_of(challenge: bytes) -> str:
+    "The namespace a challenge is signed under. It comes from the bytes signed, never from who asks."
+    return GRANT_NAMESPACE if "grant" in json.loads(challenge) else NAMESPACE
+
+
+@dataclass(frozen=True, slots=True)
+class Peer:
+    "The process that sent a request, by pid and start time."
+
+    pid: int
+    start: int
+
+
+@dataclass(frozen=True, slots=True)
 class Request:
     id: str
     secret: str
@@ -136,6 +187,11 @@ class Request:
     challenge: bytes = field(repr=False)
     #: The client does not sign: it waits for a signature someone else delivers (`Signed`).
     elsewhere: bool = False
+    #: The grant this request asks for, signed with it.
+    grant: GrantTerms | None = None
+    #: The grant this request runs under, with no touch: only its sender may approve it.
+    granted: str | None = None
+    sender: Peer | None = None
 
 
 def challenge(
@@ -149,22 +205,26 @@ def challenge(
     requester: str | None,
     mode: ExecMode,
     sources: Mapping[str, str],
+    grant: GrantTerms | None = None,
 ) -> bytes:
     "What the person signs. Canonical JSON, so the same request is the same bytes."
+    fields: dict[str, object] = {
+        "touchgate": 1,
+        "id": id,
+        "nonce": nonce,
+        "expires": expires,
+        "secret": secret,
+        "item": item_id,
+        "argv": list(argv),
+        "cwd": cwd,
+        "requester": requester,
+        "exec": mode,
+        "variables": dict(sources),
+    }
+    if grant is not None:
+        fields["grant"] = grant.described()
     return json.dumps(
-        {
-            "touchgate": 1,
-            "id": id,
-            "nonce": nonce,
-            "expires": expires,
-            "secret": secret,
-            "item": item_id,
-            "argv": list(argv),
-            "cwd": cwd,
-            "requester": requester,
-            "exec": mode,
-            "variables": dict(sources),
-        },
+        fields,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -185,8 +245,11 @@ class Requests:
         mode: ExecMode,
         explicit: Mapping[str, str],
         elsewhere: bool = False,
+        grant: GrantTerms | None = None,
     ) -> Request:
         self._expire()
+        if grant is not None and mode is not ExecMode.BROKER:
+            raise ApprovalError("a grant runs its commands in the broker, never in the client")
         if len(self.pending) >= MAX_PENDING:
             raise ApprovalError("%d requests already wait for a touch" % MAX_PENDING)
         if not argv:
@@ -215,8 +278,9 @@ class Requests:
             sources=chosen,
             expires=expires,
             deadline=time.monotonic() + LIFETIME,
-            challenge=challenge(id, nonce, expires, secret, item.id, argv, cwd, requester, mode, chosen),
+            challenge=challenge(id, nonce, expires, secret, item.id, argv, cwd, requester, mode, chosen, grant),
             elsewhere=elsewhere,
+            grant=grant,
         )
         self.pending[id] = request
         return request

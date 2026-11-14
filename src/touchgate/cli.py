@@ -1,8 +1,10 @@
 """
 `touchgate broker` runs the service. `unlock`, `lock` and `status` talk
 to it over its socket. `run` asks it for a secret and runs a command
-with it, once a security key signs the request. `enroll` seals the
-master password to a security key, which `unlock --yubikey` then opens.
+with it, once a security key signs the request; `run --grant` asks for
+more runs with no touch, and `grants` and `revoke` show and end them.
+`enroll` seals the master password to a security key, which
+`unlock --yubikey` then opens.
 """
 
 from __future__ import annotations
@@ -19,11 +21,12 @@ import sys
 
 import anyio
 
-from . import config
+from . import config, processes
 from .approval import ApprovalError, Outcome
 from .broker import Broker, Lines, ask, not_dumpable
 from .client import approved_env, describe, run_in_broker, ssh_sign
 from .display import show
+from .grants import parse_duration
 from .sealed import Fido2Key, Sealed, SealError, seal, unseal, write
 
 
@@ -115,7 +118,29 @@ def _announce(line: str) -> None:
     print("touchgate: %s" % line, file=sys.stderr, flush=True)
 
 
-async def _run(secret: str, command: list[str], env: dict[str, str], client_exec: bool) -> int:
+def _grant(args: argparse.Namespace) -> dict[str, object] | None:
+    "The grant terms `run` asks for. The broker reads the anchor's facts from /proc itself."
+    if args.grant is None:
+        return None
+    if args.client_exec:
+        raise ApprovalError("a grant runs its commands in the broker, so it takes no --client-exec")
+    anchor = args.grant_to
+    if anchor is None:
+        claude = processes.nearest_claude(os.getpid())
+        if claude is None:
+            raise ApprovalError("no Claude Code process runs above this one; name the anchor with --grant-to PID")
+        anchor = claude.pid
+    return {
+        "seconds": parse_duration(args.grant),
+        "uses": args.grant_uses,
+        "prefix": args.grant_prefix,
+        "anchor": anchor,
+    }
+
+
+async def _run(
+    secret: str, command: list[str], env: dict[str, str], client_exec: bool, grant: dict[str, object] | None
+) -> int:
     settings = config.load()
     path = shutil.which(command[0])
     if path is None:
@@ -135,6 +160,7 @@ async def _run(secret: str, command: list[str], env: dict[str, str], client_exec
             env=env,
             environ=os.environ,
             announce=_announce,
+            grant=grant,
         )
     values = await approved_env(
         config.socket_path(), secret, argv, sign, cwd=os.getcwd(), requester=requester, env=env, announce=_announce
@@ -153,6 +179,20 @@ def _pair(text: str) -> tuple[str, str]:
 
 async def _simple(op: str) -> int:
     return _report(await ask(config.socket_path(), {"op": op}))
+
+
+async def _grants() -> int:
+    answer = await ask(config.socket_path(), {"op": "grants"})
+    if answer.get("ok"):
+        print(json.dumps(answer["grants"], indent=2))
+    return _report(answer)
+
+
+async def _revoke(id: str | None) -> int:
+    answer = await ask(config.socket_path(), {"op": "revoke", "id": id})
+    if answer.get("ok"):
+        print(json.dumps(answer["revoked"]))
+    return _report(answer)
 
 
 def _report(answer: dict[str, object]) -> int:
@@ -177,6 +217,11 @@ def main(argv: list[str] | None = None) -> int:
     popup.add_argument("socket", help="The plugin's socket for this one request.")
     commands.add_parser("lock", help="Make the broker forget the vault.")
     commands.add_parser("status", help="Say whether the broker holds the vault.")
+    commands.add_parser("grants", help="List the grants that hold, as JSON.")
+    revoke = commands.add_parser("revoke", help="End a grant, or every grant.")
+    which = revoke.add_mutually_exclusive_group(required=True)
+    which.add_argument("id", nargs="?", help="The grant id, from `touchgate grants`.")
+    which.add_argument("--all", action="store_true", help="End every grant.")
     run = commands.add_parser("run", help="Run a command with a secret, once a security key approves.")
     run.add_argument(
         "--env",
@@ -190,6 +235,24 @@ def main(argv: list[str] | None = None) -> int:
         "--client-exec",
         action="store_true",
         help="Receive the values and start the command here. The broker then cannot hold you to the command.",
+    )
+    run.add_argument(
+        "--grant",
+        metavar="DURATION",
+        help="Also approve later runs of this command, such as 8h or 30m, under one process tree, with no touch.",
+    )
+    run.add_argument(
+        "--grant-to",
+        type=int,
+        metavar="PID",
+        help="The process the grant holds under. Default: the nearest Claude Code process above this one.",
+    )
+    run.add_argument("--grant-uses", type=int, metavar="N", help="End the grant after N runs.")
+    run.add_argument(
+        "--grant-prefix",
+        type=int,
+        metavar="N",
+        help="Grant any command whose first N words match this one. Default: the exact command.",
     )
     run.add_argument("secret", help="The vault item, by name or id.")
     run.add_argument("program", nargs=argparse.REMAINDER, help="-- and the command to run.")
@@ -212,7 +275,12 @@ def main(argv: list[str] | None = None) -> int:
                 program: list[str] = args.program[1:] if args.program[:1] == ["--"] else args.program
                 if not program:
                     parser.error("run needs a command after --")
-                return anyio.run(_run, str(args.secret), program, dict(args.env), bool(args.client_exec))
+                grant = _grant(args)
+                return anyio.run(_run, str(args.secret), program, dict(args.env), bool(args.client_exec), grant)
+            case "grants":
+                return anyio.run(_grants)
+            case "revoke":
+                return anyio.run(_revoke, None if args.all else str(args.id))
             case command:
                 return anyio.run(_simple, command)
     except (config.ConfigError, ApprovalError, SealError, OSError) as error:

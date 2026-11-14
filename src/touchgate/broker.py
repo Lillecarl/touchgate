@@ -17,25 +17,31 @@ import os
 import signal
 import sys
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import anyio
 import anyio.abc
-from anyio.abc import UNIXSocketStream
+from anyio.abc import SocketAttribute, UNIXSocketStream
 from anyio.streams.memory import MemoryObjectSendStream
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
+from . import processes
 from .approval import (
     LIFETIME,
-    NAMESPACE,
+    Anchor,
     ApprovalError,
     ExecMode,
     Expired,
+    GrantTerms,
     Outcome,
+    Peer,
     Requests,
     approvers,
+    namespace_of,
     variables,
 )
+from .grants import MAX_SECONDS, Grants
 from .sshsig import BadSignature, SkPublicKey, verify
 from .vault import LoginFailed, Vault, open_vault
 
@@ -46,6 +52,7 @@ if TYPE_CHECKING:
 
     from .approval import Request as Pending
     from .config import Config
+    from .processes import Process
     from .vault import Device
 
 log = logging.getLogger(__name__)
@@ -81,6 +88,16 @@ class Lock(BaseModel):
     op: Literal["lock"]
 
 
+class GrantAsk(BaseModel):
+    "The grant a run asks for besides itself. The broker reads the anchor's facts itself."
+
+    seconds: int = Field(gt=0, le=MAX_SECONDS)
+    uses: int | None = Field(None, ge=1)
+    prefix: int | None = Field(None, ge=1)
+    #: A parent of the asking process, by pid.
+    anchor: int
+
+
 class Ask(BaseModel):
     "Asks for a secret. The answer is a challenge to sign, never a value."
 
@@ -94,6 +111,7 @@ class Ask(BaseModel):
     #: Approved elsewhere, through a linked pymux: a locked broker waits for
     #: an unlock, and the approve waits for a delivered signature (`Signed`).
     elsewhere: bool = False
+    grant: GrantAsk | None = None
 
 
 class Approve(BaseModel):
@@ -123,6 +141,16 @@ class Relay(BaseModel):
     signal: int
 
 
+class ListGrants(BaseModel):
+    op: Literal["grants"]
+
+
+class Revoke(BaseModel):
+    op: Literal["revoke"]
+    #: None ends every grant.
+    id: str | None = None
+
+
 class Watch(BaseModel):
     """
     Follows the requests: each one waiting when it connects, then each new
@@ -133,7 +161,9 @@ class Watch(BaseModel):
     op: Literal["watch"]
 
 
-Request = Annotated[Unlock | Status | Lock | Ask | Approve | Signed | Watch, Field(discriminator="op")]
+Request = Annotated[
+    Unlock | Status | Lock | Ask | Approve | Signed | ListGrants | Revoke | Watch, Field(discriminator="op")
+]
 REQUEST: TypeAdapter[Request] = TypeAdapter(Request)
 
 
@@ -158,6 +188,7 @@ class Broker:
         self.vault: Vault | None = None
         self.approvers: tuple[SkPublicKey, ...] = ()
         self.requests = Requests()
+        self.grants = Grants()
         self.watchers: set[MemoryObjectSendStream[dict[str, object]]] = set()
         self._unlocking = anyio.Lock()
         #: Set while the vault is open, for an `elsewhere` request that waits for an unlock.
@@ -183,6 +214,7 @@ class Broker:
         self.vault = None
         self.approvers = ()
         self.requests.clear()
+        self.grants.clear()
         self._unlocked = anyio.Event()
         self._signatures.clear()
         # Each approve that waits wakes, and finds its request gone.
@@ -219,7 +251,7 @@ class Broker:
             self.watchers.discard(send)
             send.close()
 
-    async def ask(self, request: Ask) -> dict[str, object]:
+    async def ask(self, request: Ask, sender: Process | None = None) -> dict[str, object]:
         if self.vault is None and request.elsewhere:
             # A watcher that holds the sealed password unlocks on this.
             self._notify({"event": "locked"})
@@ -231,6 +263,8 @@ class Broker:
                 self._awaiting_unlock -= 1
         if self.vault is None:
             raise ApprovalError("the broker is locked")
+        chain = [] if sender is None else processes.ancestry(sender.pid)
+        terms = None if request.grant is None else _terms(request.grant, request.argv, chain)
         pending = self.requests.add(
             self.vault,
             request.secret,
@@ -240,7 +274,15 @@ class Broker:
             request.exec,
             request.env,
             request.elsewhere,
+            terms,
         )
+        grant = None if terms is not None or not chain else self.grants.find(pending, chain)
+        if grant is not None:
+            # No event: the plugin would ask for a touch. The watch hears `run` at the approve.
+            pending = replace(pending, granted=grant.id, sender=Peer(chain[0].pid, chain[0].start))
+            self.requests.pending[pending.id] = pending
+            log.info("request %s: %s for %s, under grant %s", pending.id, pending.secret, pending.argv[0], grant.id)
+            return {"ok": True, "id": pending.id, "challenge": pending.challenge.decode(), "grant": grant.id}
         log.info("request %s: %s for %s", pending.id, pending.secret, pending.argv[0])
         self._notify(_requested(pending))
         return {"ok": True, "id": pending.id, "challenge": pending.challenge.decode(), "expires": pending.expires}
@@ -269,7 +311,12 @@ class Broker:
             self._delivered.pop(id, None)
         return self._signatures.pop(id, None)
 
-    async def approve(self, request: Approve, lines: Lines, fds: list[int]) -> dict[str, object]:
+    async def approve(
+        self, request: Approve, lines: Lines, fds: list[int], sender: Process | None = None
+    ) -> dict[str, object]:
+        waiting = self.requests.pending.get(request.id)
+        if waiting is not None and waiting.granted is not None:
+            return await self._approve_granted(request, lines, fds, sender)
         signature = request.signature
         if signature is None:
             signature = await self._delivered_signature(request.id)
@@ -282,11 +329,45 @@ class Broker:
             self._done(pending.id, Outcome.EXPIRED)
             raise Expired("no signature arrived for request %r" % pending.id)
         try:
-            values = self._release(pending, signature, fds)
+            self._verify(pending, signature)
+            values = self._values(pending, fds)
+            grant = None if pending.grant is None else self.grants.add(pending)
         except ApprovalError:
             self._done(pending.id, Outcome.REFUSED)
             raise
+        if grant is not None:
+            log.info(
+                "request %s: grant %s holds for %ds under process %d",
+                pending.id,
+                grant.id,
+                grant.deadline - time.monotonic(),
+                grant.anchor.pid,
+            )
+            self._notify({"event": "granted", "id": pending.id, "grant": grant.id})
         self._done(pending.id, Outcome.APPROVED)
+        return await self._start(pending, request, values, lines, fds)
+
+    async def _approve_granted(
+        self, request: Approve, lines: Lines, fds: list[int], sender: Process | None
+    ) -> dict[str, object]:
+        "A run under a grant. The process that asked approves it, and the grant must still cover it."
+        pending = self.requests.take(request.id)
+        try:
+            if pending.granted is None or sender is None or Peer(sender.pid, sender.start) != pending.sender:
+                raise ApprovalError("only the process that asked may run under its grant")
+            grant = self.grants.use(pending.granted, pending, processes.ancestry(sender.pid))
+            values = self._values(pending, fds)
+        except ApprovalError:
+            self._done(pending.id, Outcome.REFUSED)
+            raise
+        log.info("request %s runs under grant %s", pending.id, grant.id)
+        self._notify({"event": "run", "id": pending.id, "grant": grant.id})
+        self._done(pending.id, Outcome.APPROVED)
+        return await self._start(pending, request, values, lines, fds)
+
+    async def _start(
+        self, pending: Pending, request: Approve, values: dict[str, str], lines: Lines, fds: list[int]
+    ) -> dict[str, object]:
         match pending.mode:
             case ExecMode.CLIENT:
                 return {"ok": True, "env": values}
@@ -300,18 +381,17 @@ class Broker:
 
     def _verify(self, pending: Pending, signature: str) -> None:
         try:
-            verify(signature, pending.challenge, NAMESPACE, self.approvers)
+            verify(signature, pending.challenge, namespace_of(pending.challenge), self.approvers)
         except BadSignature as refused:
             log.warning("request %s refused: %s", pending.id, refused)
             raise ApprovalError("refused: %s" % refused) from None
 
-    def _release(self, pending: Pending, signature: str, fds: list[int]) -> dict[str, str]:
-        "The values for an approve whose signature verifies."
+    def _values(self, pending: Pending, fds: list[int]) -> dict[str, str]:
+        "The values for an approved request."
         if self.vault is None:
             raise ApprovalError("the broker is locked")
         if pending.mode is ExecMode.BROKER and len(fds) != STDIO:
             raise ApprovalError("a broker run passes stdin, stdout and stderr with its approve")
-        self._verify(pending, signature)
         try:
             item = self.vault.find(pending.item_id)
         except KeyError:
@@ -320,7 +400,9 @@ class Broker:
         log.info("request %s approved", pending.id)
         return values
 
-    async def answer(self, request: Request, lines: Lines, fds: list[int]) -> dict[str, object]:
+    async def answer(
+        self, request: Request, lines: Lines, fds: list[int], sender: Process | None = None
+    ) -> dict[str, object]:
         match request:
             case Unlock(password=password):
                 try:
@@ -335,11 +417,18 @@ class Broker:
                 self.lock()
                 return {"ok": True}
             case Ask():
-                return await self.ask(request)
+                return await self.ask(request, sender)
             case Approve():
-                return await self.approve(request, lines, fds)
+                return await self.approve(request, lines, fds, sender)
             case Signed():
                 return self.signed(request)
+            case ListGrants():
+                return {"ok": True, "grants": self.grants.listed()}
+            case Revoke(id=id):
+                ended = self.grants.revoke(id)
+                for each in ended:
+                    self._notify({"event": "revoked", "grant": each})
+                return {"ok": True, "revoked": ended}
             case Watch():
                 raise ApprovalError("a watch streams, and has no single answer")
 
@@ -357,7 +446,7 @@ class Broker:
                 if isinstance(request, Watch):
                     await self.watch(stream)
                     return
-                reply = await self.answer(request, lines, fds)
+                reply = await self.answer(request, lines, fds, _sender(stream))
             except (TimeoutError, anyio.EndOfStream, anyio.BrokenResourceError):
                 return
             except ValidationError as error:
@@ -384,6 +473,31 @@ class Broker:
         async with listener:
             task_status.started()
             await listener.serve(self.serve_one)
+
+
+def _sender(stream: anyio.abc.ByteStream) -> Process | None:
+    raw = stream.extra(SocketAttribute.raw_socket, None)
+    return None if raw is None else processes.peer(raw)
+
+
+def _terms(asked: GrantAsk, argv: list[str], chain: list[Process]) -> GrantTerms:
+    "The grant terms, with the anchor's facts read from /proc and checked against the sender's parents."
+    if not chain:
+        raise ApprovalError("a grant needs the asking process, which the broker reads on Linux only")
+    anchor = next((process for process in chain[1:] if process.pid == asked.anchor), None)
+    if anchor is None:
+        raise ApprovalError("process %d is not a parent of the process that asks" % asked.anchor)
+    # A parent of the broker too, such as the user's service manager, would cover every process of the user.
+    if processes.among(anchor.pid, anchor.start, processes.ancestry(os.getpid())):
+        raise ApprovalError("process %d (%s) is a parent of the broker too" % (anchor.pid, anchor.name))
+    if asked.prefix is not None and asked.prefix > len(argv):
+        raise ApprovalError("a prefix of %d words is longer than the command" % asked.prefix)
+    return GrantTerms(
+        seconds=asked.seconds,
+        uses=asked.uses,
+        prefix=asked.prefix,
+        anchor=Anchor(anchor.pid, anchor.start, anchor.name, processes.cwd(anchor.pid)),
+    )
 
 
 def _requested(pending: Pending) -> dict[str, object]:
