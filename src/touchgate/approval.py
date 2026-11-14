@@ -45,6 +45,17 @@ class ApprovalError(Exception):
     pass
 
 
+class Expired(ApprovalError):
+    pass
+
+
+class Outcome(StrEnum):
+    APPROVED = "approved"
+    REFUSED = "refused"
+    EXPIRED = "expired"
+    LOCKED = "locked"
+
+
 class ExecMode(StrEnum):
     #: The broker starts the command, so the values reach only the approved argv.
     BROKER = "broker"
@@ -212,7 +223,7 @@ class Requests:
         if request is None:
             raise ApprovalError("no request %r waits for a touch" % id)
         if time.monotonic() > request.deadline:
-            raise ApprovalError("request %r expired" % id)
+            raise Expired("request %r expired" % id)
         return request
 
     def clear(self) -> None:

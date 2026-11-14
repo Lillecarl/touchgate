@@ -19,9 +19,10 @@ import sys
 import anyio
 
 from . import config
-from .approval import ApprovalError
+from .approval import ApprovalError, Outcome
 from .broker import Broker, ask, not_dumpable
 from .client import approved_env, run_in_broker, ssh_sign
+from .display import show
 from .sealed import Fido2Key, Sealed, SealError, seal, unseal, write
 
 
@@ -47,6 +48,15 @@ async def _unlock(yubikey: bool) -> int:
     else:
         password = await anyio.to_thread.run_sync(getpass.getpass, "Master password: ")
     return _report(await ask(config.socket_path(), {"op": "unlock", "password": password}))
+
+
+async def _show(id: str) -> int:
+    outcome = await show(config.socket_path(), id, functools.partial(print, flush=True))
+    if outcome is None:
+        return 1
+    # The pymux popup closes when this ends: the person gets a moment to read the outcome.
+    await anyio.sleep(2)
+    return 0 if outcome is Outcome.APPROVED else 1
 
 
 async def _enroll() -> int:
@@ -121,6 +131,8 @@ def main(argv: list[str] | None = None) -> int:
     unlock = commands.add_parser("unlock", help="Give the broker the master password.")
     unlock.add_argument("--yubikey", action="store_true", help="Open the password sealed by `enroll` with a touch.")
     commands.add_parser("enroll", help="Seal the master password to the security key plugged in here.")
+    show_parser = commands.add_parser("show", help="Show a waiting request as the broker holds it, until it ends.")
+    show_parser.add_argument("id", help="The request id.")
     commands.add_parser("lock", help="Make the broker forget the vault.")
     commands.add_parser("status", help="Say whether the broker holds the vault.")
     run = commands.add_parser("run", help="Run a command with a secret, once a security key approves.")
@@ -150,6 +162,8 @@ def main(argv: list[str] | None = None) -> int:
                 return anyio.run(_unlock, bool(args.yubikey))
             case "enroll":
                 return anyio.run(_enroll)
+            case "show":
+                return anyio.run(_show, str(args.id))
             case "run":
                 program: list[str] = args.program[1:] if args.program[:1] == ["--"] else args.program
                 if not program:

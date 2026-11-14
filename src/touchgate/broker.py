@@ -21,9 +21,10 @@ from typing import TYPE_CHECKING, Annotated, Literal
 import anyio
 import anyio.abc
 from anyio.abc import UNIXSocketStream
+from anyio.streams.memory import MemoryObjectSendStream
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
-from .approval import NAMESPACE, ApprovalError, ExecMode, Requests, approvers, variables
+from .approval import NAMESPACE, ApprovalError, ExecMode, Expired, Outcome, Requests, approvers, variables
 from .sshsig import BadSignature, SkPublicKey, verify
 from .vault import LoginFailed, Vault, open_vault
 
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
 
     import httpx2
 
+    from .approval import Request as Pending
     from .config import Config
     from .vault import Device
 
@@ -41,6 +43,8 @@ log = logging.getLogger(__name__)
 MAX_REQUEST = 64 * 1024
 #: A connection that says nothing for this long is closed.
 IDLE = 10
+#: Events a watcher may fall behind by before the broker drops it.
+WATCH_BUFFER = 64
 
 PR_SET_DUMPABLE = 4
 
@@ -92,7 +96,17 @@ class Relay(BaseModel):
     signal: int
 
 
-Request = Annotated[Unlock | Status | Lock | Ask | Approve, Field(discriminator="op")]
+class Watch(BaseModel):
+    """
+    Follows the requests: each one waiting when it connects, then each new
+    one, and how each ends. A display reads this, so what it shows comes
+    from the broker and not from the requester. No value is ever in it.
+    """
+
+    op: Literal["watch"]
+
+
+Request = Annotated[Unlock | Status | Lock | Ask | Approve | Watch, Field(discriminator="op")]
 REQUEST: TypeAdapter[Request] = TypeAdapter(Request)
 
 
@@ -117,6 +131,7 @@ class Broker:
         self.vault: Vault | None = None
         self.approvers: tuple[SkPublicKey, ...] = ()
         self.requests = Requests()
+        self.watchers: set[MemoryObjectSendStream[dict[str, object]]] = set()
         self._unlocking = anyio.Lock()
 
     async def unlock(self, password: str) -> None:
@@ -128,9 +143,39 @@ class Broker:
         log.info("unlocked: %d items, %d approver keys", len(self.vault.items), len(self.approvers))
 
     def lock(self) -> None:
+        for id in list(self.requests.pending):
+            self._done(id, Outcome.LOCKED)
         self.vault = None
         self.approvers = ()
         self.requests.clear()
+
+    def _notify(self, event: dict[str, object]) -> None:
+        for watcher in list(self.watchers):
+            try:
+                watcher.send_nowait(event)
+            except (anyio.WouldBlock, anyio.BrokenResourceError, anyio.ClosedResourceError):
+                # A watcher that does not keep up misses events it would show late; it goes.
+                self.watchers.discard(watcher)
+                watcher.close()
+
+    def _done(self, id: str, outcome: Outcome) -> None:
+        self._notify({"event": "done", "id": id, "outcome": outcome})
+
+    async def watch(self, stream: anyio.abc.ByteStream) -> None:
+        send, receive = anyio.create_memory_object_stream[dict[str, object]](WATCH_BUFFER)
+        self.watchers.add(send)
+        try:
+            for pending in list(self.requests.pending.values()):
+                await _send(stream, _requested(pending.id, pending.challenge))
+            await _send(stream, {"event": "listening"})
+            async with receive:
+                async for event in receive:
+                    await _send(stream, event)
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            pass
+        finally:
+            self.watchers.discard(send)
+            send.close()
 
     def ask(self, request: Ask) -> dict[str, object]:
         if self.vault is None:
@@ -139,10 +184,34 @@ class Broker:
             self.vault, request.secret, tuple(request.argv), request.cwd, request.requester, request.exec, request.env
         )
         log.info("request %s: %s for %s", pending.id, pending.secret, pending.argv[0])
+        self._notify(_requested(pending.id, pending.challenge))
         return {"ok": True, "id": pending.id, "challenge": pending.challenge.decode(), "expires": pending.expires}
 
     async def approve(self, request: Approve, lines: Lines, fds: list[int]) -> dict[str, object]:
-        pending = self.requests.take(request.id)
+        try:
+            pending = self.requests.take(request.id)
+        except Expired:
+            self._done(request.id, Outcome.EXPIRED)
+            raise
+        try:
+            values = self._release(pending, request, fds)
+        except ApprovalError:
+            self._done(pending.id, Outcome.REFUSED)
+            raise
+        self._done(pending.id, Outcome.APPROVED)
+        match pending.mode:
+            case ExecMode.CLIENT:
+                return {"ok": True, "env": values}
+            case ExecMode.BROKER:
+                environment = {
+                    name: value for name, value in request.environ.items() if not name.startswith(LOADER_PREFIXES)
+                }
+                code = await _run(pending.argv, pending.cwd, environment | values, fds, lines)
+                log.info("request %s: the command exited %d", pending.id, code)
+                return {"ok": True, "exit": code}
+
+    def _release(self, pending: Pending, request: Approve, fds: list[int]) -> dict[str, str]:
+        "The values for an approve whose signature verifies."
         if self.vault is None:
             raise ApprovalError("the broker is locked")
         if pending.mode is ExecMode.BROKER and len(fds) != STDIO:
@@ -158,16 +227,7 @@ class Broker:
             raise ApprovalError("%r left the vault" % pending.secret) from None
         values = {name: value.value for name, value in variables(item, pending.explicit).items()}
         log.info("request %s approved", pending.id)
-        match pending.mode:
-            case ExecMode.CLIENT:
-                return {"ok": True, "env": values}
-            case ExecMode.BROKER:
-                environment = {
-                    name: value for name, value in request.environ.items() if not name.startswith(LOADER_PREFIXES)
-                }
-                code = await _run(pending.argv, pending.cwd, environment | values, fds, lines)
-                log.info("request %s: the command exited %d", pending.id, code)
-                return {"ok": True, "exit": code}
+        return values
 
     async def answer(self, request: Request, lines: Lines, fds: list[int]) -> dict[str, object]:
         match request:
@@ -187,6 +247,8 @@ class Broker:
                 return self.ask(request)
             case Approve():
                 return await self.approve(request, lines, fds)
+            case Watch():
+                raise ApprovalError("a watch streams, and has no single answer")
 
     async def serve_one(self, stream: anyio.abc.ByteStream) -> None:
         fds: list[int] = []
@@ -198,7 +260,11 @@ class Broker:
                         first, fds = await stream.receive_fds(MAX_REQUEST, STDIO)
                     lines = Lines(stream, first)
                     data = await lines.next()
-                reply = await self.answer(REQUEST.validate_json(data), lines, fds)
+                request = REQUEST.validate_json(data)
+                if isinstance(request, Watch):
+                    await self.watch(stream)
+                    return
+                reply = await self.answer(request, lines, fds)
             except (TimeoutError, anyio.EndOfStream, anyio.BrokenResourceError):
                 return
             except ValidationError as error:
@@ -225,6 +291,14 @@ class Broker:
         async with listener:
             task_status.started()
             await listener.serve(self.serve_one)
+
+
+def _requested(id: str, challenge: bytes) -> dict[str, object]:
+    return {"event": "request", "id": id, "challenge": challenge.decode()}
+
+
+async def _send(stream: anyio.abc.ByteStream, message: dict[str, object]) -> None:
+    await stream.send(json.dumps(message).encode() + b"\n")
 
 
 def _fields(error: ValidationError) -> str:
