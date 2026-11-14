@@ -31,6 +31,8 @@ class ConfigError(Exception):
 class Config:
     email: str
     endpoints: Endpoints
+    #: The security key `touchgate run` signs with: a key file, or a `.pub` whose key is in the agent.
+    signing_key: Path | None = None
 
     @classmethod
     def parse(cls, data: Mapping[str, object]) -> Config:
@@ -41,7 +43,10 @@ class Config:
         if not isinstance(server, str):
             raise ConfigError("`server` is `us`, `eu` or a URL")
         endpoints = SERVERS.get(server) or Endpoints.of(server)
-        return cls(email, endpoints)
+        signing_key = data.get("signing_key")
+        if signing_key is not None and not isinstance(signing_key, str):
+            raise ConfigError("`signing_key` is a path")
+        return cls(email, endpoints, Path(signing_key).expanduser() if signing_key else None)
 
 
 def _home(variable: str, fallback: str, environ: Mapping[str, str]) -> Path:

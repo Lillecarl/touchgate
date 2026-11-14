@@ -57,6 +57,7 @@ in
           testEnv
           vaultwarden
           bitwarden-cli
+          openssh
         ];
       }
       ''

@@ -21,6 +21,8 @@ import anyio
 import anyio.abc
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
+from .approval import NAMESPACE, ApprovalError, ExecMode, Requests, approvers, variables
+from .sshsig import BadSignature, SkPublicKey, verify
 from .vault import LoginFailed, Vault, open_vault
 
 if TYPE_CHECKING:
@@ -54,7 +56,25 @@ class Lock(BaseModel):
     op: Literal["lock"]
 
 
-Request = Annotated[Unlock | Status | Lock, Field(discriminator="op")]
+class Ask(BaseModel):
+    "Asks for a secret. The answer is a challenge to sign, never a value."
+
+    op: Literal["request"]
+    secret: str
+    argv: list[str] = Field(min_length=1)
+    cwd: str
+    requester: str | None = None
+    exec: ExecMode = ExecMode.CLIENT
+    env: dict[str, str] = {}
+
+
+class Approve(BaseModel):
+    op: Literal["approve"]
+    id: str
+    signature: str = Field(repr=False)
+
+
+Request = Annotated[Unlock | Status | Lock | Ask | Approve, Field(discriminator="op")]
 REQUEST: TypeAdapter[Request] = TypeAdapter(Request)
 
 
@@ -77,6 +97,8 @@ class Broker:
         self.device = device
         self.transport = transport
         self.vault: Vault | None = None
+        self.approvers: tuple[SkPublicKey, ...] = ()
+        self.requests = Requests()
         self._unlocking = anyio.Lock()
 
     async def unlock(self, password: str) -> None:
@@ -84,7 +106,39 @@ class Broker:
             self.vault = await open_vault(
                 self.config.endpoints, self.config.email, password, self.device, transport=self.transport
             )
-        log.info("unlocked: %d items", len(self.vault.items))
+            self.approvers = approvers(self.vault)
+        log.info("unlocked: %d items, %d approver keys", len(self.vault.items), len(self.approvers))
+
+    def lock(self) -> None:
+        self.vault = None
+        self.approvers = ()
+        self.requests.clear()
+
+    def ask(self, request: Ask) -> dict[str, object]:
+        if self.vault is None:
+            raise ApprovalError("the broker is locked")
+        pending = self.requests.add(
+            self.vault, request.secret, tuple(request.argv), request.cwd, request.requester, request.exec, request.env
+        )
+        log.info("request %s: %s for %s", pending.id, pending.secret, pending.argv[0])
+        return {"ok": True, "id": pending.id, "challenge": pending.challenge.decode(), "expires": pending.expires}
+
+    def approve(self, request: Approve) -> dict[str, object]:
+        pending = self.requests.take(request.id)
+        if self.vault is None:
+            raise ApprovalError("the broker is locked")
+        try:
+            verify(request.signature, pending.challenge, NAMESPACE, self.approvers)
+        except BadSignature as refused:
+            log.warning("request %s refused: %s", pending.id, refused)
+            raise ApprovalError("refused: %s" % refused) from None
+        values = variables(self.vault.find(pending.item_id), pending.explicit)
+        log.info("request %s approved", pending.id)
+        match pending.mode:
+            case ExecMode.CLIENT:
+                return {"ok": True, "env": {name: value.value for name, value in values.items()}}
+            case ExecMode.BROKER:
+                raise ApprovalError("the broker does not start commands yet")
 
     async def answer(self, request: Request) -> dict[str, object]:
         match request:
@@ -98,8 +152,12 @@ class Broker:
                 items = None if self.vault is None else len(self.vault.items)
                 return {"ok": True, "unlocked": self.vault is not None, "items": items}
             case Lock():
-                self.vault = None
+                self.lock()
                 return {"ok": True}
+            case Ask():
+                return self.ask(request)
+            case Approve():
+                return self.approve(request)
 
     async def serve_one(self, stream: anyio.abc.ByteStream) -> None:
         async with stream:
@@ -112,7 +170,7 @@ class Broker:
             except ValidationError as error:
                 # The error names fields, never their values: `input` is dropped.
                 reply = {"ok": False, "error": "a request this broker does not read: %s" % _fields(error)}
-            except ValueError as error:
+            except (ApprovalError, ValueError) as error:
                 reply = {"ok": False, "error": str(error)}
             except Exception:
                 # An exception here would end the listener, and every later client with it.

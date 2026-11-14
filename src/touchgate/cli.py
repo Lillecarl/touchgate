@@ -1,19 +1,25 @@
 """
 `touchgate broker` runs the service. `unlock`, `lock` and `status` talk
-to it over its socket.
+to it over its socket. `run` asks it for a secret and runs a command
+with it, once a security key signs the request.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import getpass
 import logging
+import os
+import shutil
 import sys
 
 import anyio
 
 from . import config
+from .approval import ApprovalError
 from .broker import Broker, ask, not_dumpable
+from .client import approved_env, ssh_sign
 
 
 async def _broker() -> int:
@@ -31,6 +37,38 @@ async def _broker() -> int:
 async def _unlock() -> int:
     password = await anyio.to_thread.run_sync(getpass.getpass, "Master password: ")
     return _report(await ask(config.socket_path(), {"op": "unlock", "password": password}))
+
+
+def _announce(line: str) -> None:
+    print("touchgate: %s" % line, file=sys.stderr, flush=True)
+
+
+async def _run(secret: str, command: list[str], env: dict[str, str]) -> int:
+    settings = config.load()
+    if settings.signing_key is None:
+        raise config.ConfigError("the configuration names no `signing_key` to approve with")
+    path = shutil.which(command[0])
+    if path is None:
+        raise config.ConfigError("no command %r on PATH" % command[0])
+    argv = [os.path.abspath(path), *command[1:]]
+    values = await approved_env(
+        config.socket_path(),
+        secret,
+        argv,
+        functools.partial(ssh_sign, settings.signing_key),
+        cwd=os.getcwd(),
+        requester=os.environ.get("PYMUX"),
+        env=env,
+        announce=_announce,
+    )
+    os.execve(argv[0], argv, os.environ | values)
+
+
+def _pair(text: str) -> tuple[str, str]:
+    name, separator, source = text.partition("=")
+    if not separator:
+        raise argparse.ArgumentTypeError("%r is not NAME=SOURCE" % text)
+    return name, source
 
 
 async def _simple(op: str) -> int:
@@ -53,6 +91,17 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("unlock", help="Give the broker the master password.")
     commands.add_parser("lock", help="Make the broker forget the vault.")
     commands.add_parser("status", help="Say whether the broker holds the vault.")
+    run = commands.add_parser("run", help="Run a command with a secret, once a security key approves.")
+    run.add_argument(
+        "--env",
+        action="append",
+        type=_pair,
+        default=[],
+        metavar="NAME=SOURCE",
+        help="Also set NAME from the item's username, password, notes or a field.",
+    )
+    run.add_argument("secret", help="The vault item, by name or id.")
+    run.add_argument("program", nargs=argparse.REMAINDER, help="-- and the command to run.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="touchgate: %(message)s")
@@ -62,8 +111,13 @@ def main(argv: list[str] | None = None) -> int:
                 return anyio.run(_broker)
             case "unlock":
                 return anyio.run(_unlock)
+            case "run":
+                program: list[str] = args.program[1:] if args.program[:1] == ["--"] else args.program
+                if not program:
+                    parser.error("run needs a command after --")
+                return anyio.run(_run, str(args.secret), program, dict(args.env))
             case command:
                 return anyio.run(_simple, command)
-    except (config.ConfigError, OSError) as error:
+    except (config.ConfigError, ApprovalError, OSError) as error:
         print("touchgate: %s" % error, file=sys.stderr)
         return 1
