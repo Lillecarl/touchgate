@@ -16,9 +16,10 @@ import pytest
 from approving import ARGV, DEADLINE, PASSWORD, signer
 from authenticator import SoftKey, plain_signature
 from touchgate import config
-from touchgate.approval import APPROVERS_ITEM, ApprovalError, ExecMode, approvers
+from touchgate.approval import APPROVERS_ITEM, LIFETIME, ApprovalError, ExecMode, approvers
 from touchgate.broker import ask
 from touchgate.client import approved_env, request
+from touchgate.display import events
 from touchgate.sshsig import SkFlags
 from touchgate.vault import Item, Secret, Vault
 
@@ -137,6 +138,71 @@ async def test_locking_drops_the_requests(socket, broker, approver):
             await broker.unlock(PASSWORD)
     assert answer["ok"] is False
     assert locked["ok"] is False and "locked" in str(locked["error"])
+
+
+async def _ask_elsewhere(socket):
+    return await request(
+        socket, "database", ARGV, cwd="/srv", requester="%1", mode=ExecMode.CLIENT, env={}, elsewhere=True
+    )
+
+
+async def test_a_delivered_signature_approves_a_waiting_client(socket, approver):
+    approved: dict[str, object] = {}
+    with anyio.fail_after(DEADLINE):
+        id, challenge = await _ask_elsewhere(socket)
+        async with anyio.create_task_group() as tasks:
+
+            async def client() -> None:
+                approved.update(await _approve(socket, id, None))
+
+            tasks.start_soon(client)
+            # A bad signature is refused at once and leaves the request waiting.
+            bad = await ask(socket, {"op": "signed", "id": id, "signature": SoftKey().sign(challenge)})
+            good = await ask(socket, {"op": "signed", "id": id, "signature": approver.sign(challenge)})
+    assert bad["ok"] is False and "may not approve" in str(bad["error"])
+    assert good["ok"] is True
+    assert approved["ok"] is True and approved["env"] == {"API_TOKEN": "t0ken"}
+
+
+async def test_a_waiting_client_gives_up_when_its_request_expires(socket, broker):
+    with anyio.fail_after(DEADLINE):
+        id, _ = await _ask_elsewhere(socket)
+        pending = broker.requests.pending[id]
+        broker.requests.pending[id] = dataclasses.replace(pending, deadline=pending.deadline - LIFETIME + 0.2)
+        answer = await _approve(socket, id, None)
+    assert answer["ok"] is False and "expired" in str(answer["error"])
+
+
+async def test_a_request_its_client_signs_takes_no_delivered_signature(socket, approver):
+    with anyio.fail_after(DEADLINE):
+        id, challenge = await _ask(socket)
+        delivered = await ask(socket, {"op": "signed", "id": id, "signature": approver.sign(challenge)})
+        waited = await _approve(socket, id, None)
+    assert delivered["ok"] is False and "waits for a delivered signature" in str(delivered["error"])
+    assert waited["ok"] is False and "waits for a delivered signature" in str(waited["error"])
+
+
+async def test_a_locked_broker_waits_for_an_unlock_for_a_request_approved_elsewhere(socket, broker):
+    with anyio.fail_after(DEADLINE):
+        await ask(socket, {"op": "lock"})
+        try:
+            listening = anyio.Event()
+            async with anyio.create_task_group() as tasks:
+
+                async def unlock_when_asked() -> None:
+                    async for event in events(socket):
+                        if event.get("event") == "listening":
+                            listening.set()
+                        if event.get("event") == "locked":
+                            await broker.unlock(PASSWORD)
+                            return
+
+                tasks.start_soon(unlock_when_asked)
+                await listening.wait()
+                id, _ = await _ask_elsewhere(socket)
+        finally:
+            await broker.unlock(PASSWORD)
+    assert id in broker.requests.pending
 
 
 async def test_no_value_or_signature_reaches_the_log(socket, approver, caplog):

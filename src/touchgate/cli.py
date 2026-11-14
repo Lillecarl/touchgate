@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import functools
 import getpass
+import json
 import logging
 import os
 import shutil
@@ -20,8 +21,8 @@ import anyio
 
 from . import config
 from .approval import ApprovalError, Outcome
-from .broker import Broker, ask, not_dumpable
-from .client import approved_env, run_in_broker, ssh_sign
+from .broker import Broker, Lines, ask, not_dumpable
+from .client import approved_env, describe, run_in_broker, ssh_sign
 from .display import show
 from .sealed import Fido2Key, Sealed, SealError, seal, unseal, write
 
@@ -70,19 +71,58 @@ async def _enroll() -> int:
     return 0
 
 
+async def _popup(path: str) -> int:
+    """
+    On the machine with the key, in the popup the pymux plugin opens: read
+    what a linked server asks, show it, and answer it with a touch.
+    """
+    async with await anyio.connect_unix(path) as stream:
+        lines = Lines(stream)
+        asked = json.loads(await lines.next())
+        peer = str(asked.get("peer"))
+        try:
+            answer = await _answer_linked(peer, asked)
+        except (config.ConfigError, ApprovalError, SealError, OSError) as error:
+            print("touchgate: %s" % error, flush=True)
+            answer = {"error": str(error)}
+        await stream.send(json.dumps(answer).encode() + b"\n")
+    if "error" in answer:
+        await anyio.sleep(3)
+    return 0 if "error" not in answer else 1
+
+
+async def _answer_linked(peer: str, asked: dict[str, object]) -> dict[str, object]:
+    match asked.get("op"):
+        case "sign":
+            challenge = str(asked.get("challenge")).encode()
+            print("%s asks:\n%s" % (peer, describe(challenge)), flush=True)
+            settings = config.load()
+            if settings.signing_key is None:
+                raise config.ConfigError("the configuration here names no `signing_key` to sign with")
+            return {"signature": await ssh_sign(settings.signing_key, challenge)}
+        case "unlock":
+            print("%s asks for the master password, to unlock its touchgate broker." % peer, flush=True)
+            try:
+                sealed = Sealed.loads(await anyio.Path(config.sealed_file()).read_text())
+            except FileNotFoundError:
+                raise config.ConfigError("no sealed password here; run touchgate enroll") from None
+            return {"password": await unseal(Fido2Key(_announce), sealed)}
+        case op:
+            raise ApprovalError("a linked server asks for %r, which touchgate does not do" % op)
+
+
 def _announce(line: str) -> None:
     print("touchgate: %s" % line, file=sys.stderr, flush=True)
 
 
 async def _run(secret: str, command: list[str], env: dict[str, str], client_exec: bool) -> int:
     settings = config.load()
-    if settings.signing_key is None:
-        raise config.ConfigError("the configuration names no `signing_key` to approve with")
     path = shutil.which(command[0])
     if path is None:
         raise config.ConfigError("no command %r on PATH" % command[0])
     argv = [os.path.abspath(path), *command[1:]]
-    sign = functools.partial(ssh_sign, settings.signing_key)
+    # With no key here, the pymux plugin asks the linked machine that holds one.
+    sign = None if settings.signing_key is None else functools.partial(ssh_sign, settings.signing_key)
     requester = os.environ.get("PYMUX")
     if not client_exec:
         return await run_in_broker(
@@ -133,6 +173,8 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("enroll", help="Seal the master password to the security key plugged in here.")
     show_parser = commands.add_parser("show", help="Show a waiting request as the broker holds it, until it ends.")
     show_parser.add_argument("id", help="The request id.")
+    popup = commands.add_parser("popup", help="Answer a linked server's request, in the pymux plugin's popup.")
+    popup.add_argument("socket", help="The plugin's socket for this one request.")
     commands.add_parser("lock", help="Make the broker forget the vault.")
     commands.add_parser("status", help="Say whether the broker holds the vault.")
     run = commands.add_parser("run", help="Run a command with a secret, once a security key approves.")
@@ -164,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
                 return anyio.run(_enroll)
             case "show":
                 return anyio.run(_show, str(args.id))
+            case "popup":
+                return anyio.run(_popup, str(args.socket))
             case "run":
                 program: list[str] = args.program[1:] if args.program[:1] == ["--"] else args.program
                 if not program:

@@ -55,12 +55,16 @@ grants a secret.
 
 ## Approval routes
 
-- **SSH security key:** an `ed25519-sk` key on the YubiKey signs the
-  challenge; the broker checks it with `ssh-keygen -Y verify`. From a
-  pymux pane on another machine, this needs agent forwarding over the
-  pymux link (Lillecarl/pyterm#986).
-- **WebAuthn:** the broker serves an approval page; the person opens it
-  and touches the key in the browser. Works without pymux.
+- **SSH security key here:** with `signing_key` set, `touchgate run`
+  signs the challenge with `ssh-keygen` and an `ed25519-sk` key on the
+  YubiKey. The broker verifies the signature itself.
+- **SSH security key on a linked pymux:** with no `signing_key`, the
+  request waits for a signature from elsewhere. The pymux plugin where
+  the broker runs asks the touchgate plugin on each linked pymux server
+  in turn. On the machine with the key, a popup shows the request, and
+  `ssh-keygen` there signs it with a touch. The signature crosses the
+  pymux link, and the broker verifies it on arrival. A machine with the
+  key answers only a server its own pymux dialled.
 
 ## Unlocking
 
@@ -74,11 +78,14 @@ The broker starts locked. Three ways open it:
   the master password. This runs where the key is plugged in:
 
       touchgate enroll    # two touches; writes ~/.config/touchgate/sealed-password.json
-      ssh -N -L /tmp/touchgate.sock:/run/user/1000/touchgate/broker.sock dynhetz &
-      TOUCHGATE_SOCKET=/tmp/touchgate.sock touchgate unlock --yubikey
 
-  The sealed file opens only with that key, touched. The password
-  crosses the SSH link to the broker.
+  The sealed file opens only with that key, touched. A request that
+  waits for a signature from elsewhere also waits for a locked broker to
+  unlock. The pymux plugin then asks the linked machine with the key: a
+  popup there says which server asks, and a touch opens the sealed
+  password. The password crosses the pymux link to the broker. Without
+  pymux, `touchgate unlock --yubikey` does the same over a socket that
+  `TOUCHGATE_SOCKET` names, such as one forwarded by `ssh -L`.
 
 ## The pymux popup
 
@@ -94,7 +101,10 @@ From Nix, the package names the file as `touchgate.pymuxPlugin`:
 
     xdg.configFile."pymux/plugins/touchgate.py".source = touchgate.pymuxPlugin;
 
-`touchgate` must be on the PATH of the pymux server.
+`touchgate` must be on the PATH of the pymux server. Install the plugin
+on both machines: where the broker runs, and where the key is plugged
+in. The pymux link between them needs pymux with plugin messages
+(Lillecarl/pyterm#988) on both ends.
 
 ## Configuration
 
@@ -102,7 +112,8 @@ From Nix, the package names the file as `touchgate.pymuxPlugin`:
 
     email = "you@example.com"
     server = "eu"                          # us, eu, or a self-hosted URL
-    signing_key = "~/.ssh/id_ed25519_sk"   # or a .pub whose key is in the agent
+    signing_key = "~/.ssh/id_ed25519_sk"   # or a .pub whose key is in the agent;
+                                           # leave it out to sign on a linked pymux
 
 ## What this does not stop
 

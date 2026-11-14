@@ -8,7 +8,7 @@ holds the credential id, the salt and the ciphertext, and opens only
 with that key plugged in and touched.
 
 This runs where the key is plugged in: on the Mac, which then sends the
-password to the broker over an SSH-forwarded socket.
+password to the broker over the pymux link, or over a forwarded socket.
 """
 
 from __future__ import annotations

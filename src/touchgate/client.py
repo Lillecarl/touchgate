@@ -19,8 +19,9 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
     from pathlib import Path
 
-#: Signs challenge bytes and answers an armoured SSH signature.
-type Signer = Callable[[bytes], Awaitable[str]]
+#: Signs challenge bytes and answers an armoured SSH signature. None leaves the
+#: signing to a linked pymux, whose plugin delivers the signature to the broker.
+type Signer = Callable[[bytes], Awaitable[str]] | None
 
 
 async def ssh_sign(key: Path, challenge: bytes) -> str:
@@ -44,6 +45,7 @@ async def request(
     requester: str | None,
     mode: ExecMode,
     env: Mapping[str, str],
+    elsewhere: bool = False,
 ) -> tuple[str, bytes]:
     "Asks for `secret` for `argv`, and answers the request id and its challenge."
     reply = await ask(
@@ -56,6 +58,7 @@ async def request(
             "requester": requester,
             "exec": mode,
             "env": dict(env),
+            "elsewhere": elsewhere,
         },
     )
     if not reply.get("ok"):
@@ -75,9 +78,11 @@ async def approved_env(
     announce: Callable[[str], None],
 ) -> dict[str, str]:
     "The values for `argv`, once the key signs. The client starts the command itself."
-    id, challenge = await request(socket, secret, argv, cwd=cwd, requester=requester, mode=ExecMode.CLIENT, env=env)
-    announce(describe(challenge))
-    answer = await ask(socket, {"op": "approve", "id": id, "signature": await sign(challenge)})
+    id, challenge = await request(
+        socket, secret, argv, cwd=cwd, requester=requester, mode=ExecMode.CLIENT, env=env, elsewhere=sign is None
+    )
+    announce(describe(challenge, sign is None))
+    answer = await ask(socket, {"op": "approve", "id": id, "signature": await _signature(sign, challenge)})
     if not answer.get("ok"):
         raise ApprovalError(str(answer.get("error")))
     values = answer["env"]
@@ -106,9 +111,11 @@ async def run_in_broker(
     # The approve carries the environment. Too large, and the broker would refuse it after the touch.
     if len(json.dumps(dict(environ))) > MAX_REQUEST // 2:
         raise ApprovalError("the environment is over %d bytes, too large to pass to the broker" % (MAX_REQUEST // 2))
-    id, challenge = await request(socket, secret, argv, cwd=cwd, requester=requester, mode=ExecMode.BROKER, env=env)
-    announce(describe(challenge))
-    approve = {"op": "approve", "id": id, "signature": await sign(challenge), "environ": dict(environ)}
+    id, challenge = await request(
+        socket, secret, argv, cwd=cwd, requester=requester, mode=ExecMode.BROKER, env=env, elsewhere=sign is None
+    )
+    announce(describe(challenge, sign is None))
+    approve = {"op": "approve", "id": id, "signature": await _signature(sign, challenge), "environ": dict(environ)}
     async with await anyio.connect_unix(socket) as stream:
         await stream.send_fds(json.dumps(approve).encode() + b"\n", stdio)
         async with anyio.create_task_group() as tasks:
@@ -128,14 +135,19 @@ async def run_in_broker(
     return 128 - code if code < 0 else code
 
 
-def describe(challenge: bytes) -> str:
+async def _signature(sign: Signer, challenge: bytes) -> str | None:
+    return None if sign is None else await sign(challenge)
+
+
+def describe(challenge: bytes, elsewhere: bool = False) -> str:
     "Everything the challenge holds, for the person about to sign it."
     fields = json.loads(challenge)
     variables = ", ".join("%s from %s" % pair for pair in fields["variables"].items()) or "none"
     starter = "the broker" if fields["exec"] == ExecMode.BROKER else "this client, which gets the values"
+    where = "on the machine a linked pymux runs on" if elsewhere else ""
     return "\n".join(
         [
-            "touch the key to approve request %s:" % fields["id"],
+            "touch the key %sto approve request %s:" % (where + " " if where else "", fields["id"]),
             "  secret     %s (item %s)" % (fields["secret"], fields["item"]),
             "  command    %s" % shlex.join(fields["argv"]),
             "  directory  %s" % fields["cwd"],

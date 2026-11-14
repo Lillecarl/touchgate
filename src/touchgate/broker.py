@@ -16,6 +16,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import anyio
@@ -24,7 +25,17 @@ from anyio.abc import UNIXSocketStream
 from anyio.streams.memory import MemoryObjectSendStream
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
-from .approval import NAMESPACE, ApprovalError, ExecMode, Expired, Outcome, Requests, approvers, variables
+from .approval import (
+    LIFETIME,
+    NAMESPACE,
+    ApprovalError,
+    ExecMode,
+    Expired,
+    Outcome,
+    Requests,
+    approvers,
+    variables,
+)
 from .sshsig import BadSignature, SkPublicKey, verify
 from .vault import LoginFailed, Vault, open_vault
 
@@ -80,14 +91,30 @@ class Ask(BaseModel):
     requester: str | None = None
     exec: ExecMode = ExecMode.BROKER
     env: dict[str, str] = {}
+    #: Approved elsewhere, through a linked pymux: a locked broker waits for
+    #: an unlock, and the approve waits for a delivered signature (`Signed`).
+    elsewhere: bool = False
 
 
 class Approve(BaseModel):
     op: Literal["approve"]
     id: str
-    signature: str = Field(repr=False)
+    #: None waits for the signature `Signed` delivers, until the request expires.
+    signature: str | None = Field(None, repr=False)
     #: A broker run's base environment, from the client. The fds come with the message.
     environ: dict[str, str] = Field({}, repr=False)
+
+
+class Signed(BaseModel):
+    """
+    A signature for a request whose client waits for one, from whoever
+    holds the key: the pymux plugin. The broker verifies it on arrival, so
+    a bad one never consumes the request.
+    """
+
+    op: Literal["signed"]
+    id: str
+    signature: str = Field(repr=False)
 
 
 class Relay(BaseModel):
@@ -106,7 +133,7 @@ class Watch(BaseModel):
     op: Literal["watch"]
 
 
-Request = Annotated[Unlock | Status | Lock | Ask | Approve | Watch, Field(discriminator="op")]
+Request = Annotated[Unlock | Status | Lock | Ask | Approve | Signed | Watch, Field(discriminator="op")]
 REQUEST: TypeAdapter[Request] = TypeAdapter(Request)
 
 
@@ -133,6 +160,13 @@ class Broker:
         self.requests = Requests()
         self.watchers: set[MemoryObjectSendStream[dict[str, object]]] = set()
         self._unlocking = anyio.Lock()
+        #: Set while the vault is open, for an `elsewhere` request that waits for an unlock.
+        self._unlocked = anyio.Event()
+        #: How many of those wait now: a watcher that connects meanwhile hears `locked` too.
+        self._awaiting_unlock = 0
+        #: Verified signatures that `Signed` delivered, and the events their approves wait on, by request id.
+        self._signatures: dict[str, str] = {}
+        self._delivered: dict[str, anyio.Event] = {}
 
     async def unlock(self, password: str) -> None:
         async with self._unlocking:
@@ -140,6 +174,7 @@ class Broker:
                 self.config.endpoints, self.config.email, password, self.device, transport=self.transport
             )
             self.approvers = approvers(self.vault)
+        self._unlocked.set()
         log.info("unlocked: %d items, %d approver keys", len(self.vault.items), len(self.approvers))
 
     def lock(self) -> None:
@@ -148,6 +183,11 @@ class Broker:
         self.vault = None
         self.approvers = ()
         self.requests.clear()
+        self._unlocked = anyio.Event()
+        self._signatures.clear()
+        # Each approve that waits wakes, and finds its request gone.
+        for delivered in self._delivered.values():
+            delivered.set()
 
     def _notify(self, event: dict[str, object]) -> None:
         for watcher in list(self.watchers):
@@ -165,8 +205,10 @@ class Broker:
         send, receive = anyio.create_memory_object_stream[dict[str, object]](WATCH_BUFFER)
         self.watchers.add(send)
         try:
+            if self._awaiting_unlock:
+                await _send(stream, {"event": "locked"})
             for pending in list(self.requests.pending.values()):
-                await _send(stream, _requested(pending.id, pending.challenge))
+                await _send(stream, _requested(pending))
             await _send(stream, {"event": "listening"})
             async with receive:
                 async for event in receive:
@@ -177,24 +219,70 @@ class Broker:
             self.watchers.discard(send)
             send.close()
 
-    def ask(self, request: Ask) -> dict[str, object]:
+    async def ask(self, request: Ask) -> dict[str, object]:
+        if self.vault is None and request.elsewhere:
+            # A watcher that holds the sealed password unlocks on this.
+            self._notify({"event": "locked"})
+            self._awaiting_unlock += 1
+            try:
+                with anyio.move_on_after(LIFETIME):
+                    await self._unlocked.wait()
+            finally:
+                self._awaiting_unlock -= 1
         if self.vault is None:
             raise ApprovalError("the broker is locked")
         pending = self.requests.add(
-            self.vault, request.secret, tuple(request.argv), request.cwd, request.requester, request.exec, request.env
+            self.vault,
+            request.secret,
+            tuple(request.argv),
+            request.cwd,
+            request.requester,
+            request.exec,
+            request.env,
+            request.elsewhere,
         )
         log.info("request %s: %s for %s", pending.id, pending.secret, pending.argv[0])
-        self._notify(_requested(pending.id, pending.challenge))
+        self._notify(_requested(pending))
         return {"ok": True, "id": pending.id, "challenge": pending.challenge.decode(), "expires": pending.expires}
 
+    def signed(self, request: Signed) -> dict[str, object]:
+        pending = self.requests.pending.get(request.id)
+        if pending is None or not pending.elsewhere:
+            raise ApprovalError("no request %r waits for a delivered signature" % request.id)
+        self._verify(pending, request.signature)
+        for id in [id for id in self._signatures if id not in self.requests.pending]:
+            del self._signatures[id]
+        self._signatures[pending.id] = request.signature
+        self._delivered.setdefault(pending.id, anyio.Event()).set()
+        return {"ok": True}
+
+    async def _delivered_signature(self, id: str) -> str | None:
+        "The signature `Signed` delivers for request `id`, or None once the request expires or the broker locks."
+        pending = self.requests.pending.get(id)
+        if pending is None or not pending.elsewhere:
+            raise ApprovalError("no request %r waits for a delivered signature" % id)
+        delivered = self._delivered.setdefault(id, anyio.Event())
+        try:
+            with anyio.move_on_after(pending.deadline - time.monotonic()):
+                await delivered.wait()
+        finally:
+            self._delivered.pop(id, None)
+        return self._signatures.pop(id, None)
+
     async def approve(self, request: Approve, lines: Lines, fds: list[int]) -> dict[str, object]:
+        signature = request.signature
+        if signature is None:
+            signature = await self._delivered_signature(request.id)
         try:
             pending = self.requests.take(request.id)
         except Expired:
             self._done(request.id, Outcome.EXPIRED)
             raise
+        if signature is None:
+            self._done(pending.id, Outcome.EXPIRED)
+            raise Expired("no signature arrived for request %r" % pending.id)
         try:
-            values = self._release(pending, request, fds)
+            values = self._release(pending, signature, fds)
         except ApprovalError:
             self._done(pending.id, Outcome.REFUSED)
             raise
@@ -210,17 +298,20 @@ class Broker:
                 log.info("request %s: the command exited %d", pending.id, code)
                 return {"ok": True, "exit": code}
 
-    def _release(self, pending: Pending, request: Approve, fds: list[int]) -> dict[str, str]:
+    def _verify(self, pending: Pending, signature: str) -> None:
+        try:
+            verify(signature, pending.challenge, NAMESPACE, self.approvers)
+        except BadSignature as refused:
+            log.warning("request %s refused: %s", pending.id, refused)
+            raise ApprovalError("refused: %s" % refused) from None
+
+    def _release(self, pending: Pending, signature: str, fds: list[int]) -> dict[str, str]:
         "The values for an approve whose signature verifies."
         if self.vault is None:
             raise ApprovalError("the broker is locked")
         if pending.mode is ExecMode.BROKER and len(fds) != STDIO:
             raise ApprovalError("a broker run passes stdin, stdout and stderr with its approve")
-        try:
-            verify(request.signature, pending.challenge, NAMESPACE, self.approvers)
-        except BadSignature as refused:
-            log.warning("request %s refused: %s", pending.id, refused)
-            raise ApprovalError("refused: %s" % refused) from None
+        self._verify(pending, signature)
         try:
             item = self.vault.find(pending.item_id)
         except KeyError:
@@ -244,9 +335,11 @@ class Broker:
                 self.lock()
                 return {"ok": True}
             case Ask():
-                return self.ask(request)
+                return await self.ask(request)
             case Approve():
                 return await self.approve(request, lines, fds)
+            case Signed():
+                return self.signed(request)
             case Watch():
                 raise ApprovalError("a watch streams, and has no single answer")
 
@@ -293,8 +386,13 @@ class Broker:
             await listener.serve(self.serve_one)
 
 
-def _requested(id: str, challenge: bytes) -> dict[str, object]:
-    return {"event": "request", "id": id, "challenge": challenge.decode()}
+def _requested(pending: Pending) -> dict[str, object]:
+    return {
+        "event": "request",
+        "id": pending.id,
+        "challenge": pending.challenge.decode(),
+        "elsewhere": pending.elsewhere,
+    }
 
 
 async def _send(stream: anyio.abc.ByteStream, message: dict[str, object]) -> None:

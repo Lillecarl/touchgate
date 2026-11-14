@@ -134,6 +134,8 @@ class Request:
     expires: int
     deadline: float = field(repr=False)
     challenge: bytes = field(repr=False)
+    #: The client does not sign: it waits for a signature someone else delivers (`Signed`).
+    elsewhere: bool = False
 
 
 def challenge(
@@ -182,6 +184,7 @@ class Requests:
         requester: str | None,
         mode: ExecMode,
         explicit: Mapping[str, str],
+        elsewhere: bool = False,
     ) -> Request:
         self._expire()
         if len(self.pending) >= MAX_PENDING:
@@ -213,6 +216,7 @@ class Requests:
             expires=expires,
             deadline=time.monotonic() + LIFETIME,
             challenge=challenge(id, nonce, expires, secret, item.id, argv, cwd, requester, mode, chosen),
+            elsewhere=elsewhere,
         )
         self.pending[id] = request
         return request

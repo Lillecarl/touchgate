@@ -39,7 +39,7 @@ async def test_the_watch_replays_then_follows(socket, approver):
         refused = await anext(watch)
         await watch.aclose()
     assert replayed["event"] == "request" and replayed["id"] == waiting
-    assert announced == {"event": "request", "id": fresh, "challenge": challenge.decode()}
+    assert announced == {"event": "request", "id": fresh, "challenge": challenge.decode(), "elsewhere": False}
     assert approved == {"event": "done", "id": fresh, "outcome": "approved"}
     assert refused == {"event": "done", "id": waiting, "outcome": "refused"}
     assert "s3cr3t" not in str([replayed, announced, approved])
