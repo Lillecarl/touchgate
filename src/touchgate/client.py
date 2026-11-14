@@ -5,13 +5,14 @@ key, and hand back what the broker releases.
 
 from __future__ import annotations
 
+import json
 import shlex
 from typing import TYPE_CHECKING
 
 import anyio
 
 from .approval import NAMESPACE, ApprovalError, ExecMode
-from .broker import ask
+from .broker import RELAYED, Lines, ask
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -74,7 +75,7 @@ async def approved_env(
 ) -> dict[str, str]:
     "The values for `argv`, once the key signs. The client starts the command itself."
     id, challenge = await request(socket, secret, argv, cwd=cwd, requester=requester, mode=ExecMode.CLIENT, env=env)
-    announce("touch the key to give %s to: %s (request %s)" % (secret, shlex.join(argv), id))
+    _announce(announce, secret, argv, id)
     answer = await ask(socket, {"op": "approve", "id": id, "signature": await sign(challenge)})
     if not answer.get("ok"):
         raise ApprovalError(str(answer.get("error")))
@@ -82,3 +83,46 @@ async def approved_env(
     if not isinstance(values, dict):
         raise ApprovalError("the broker answered no values")
     return {str(name): str(value) for name, value in values.items()}
+
+
+async def run_in_broker(
+    socket: Path,
+    secret: str,
+    argv: list[str],
+    sign: Signer,
+    *,
+    cwd: str,
+    requester: str | None,
+    env: Mapping[str, str],
+    environ: Mapping[str, str],
+    announce: Callable[[str], None],
+    stdio: tuple[int, int, int] = (0, 1, 2),
+) -> int:
+    """
+    Once the key signs, the broker runs `argv` on this process's stdio,
+    so the values reach only the approved command. Answers its exit code.
+    """
+    id, challenge = await request(socket, secret, argv, cwd=cwd, requester=requester, mode=ExecMode.BROKER, env=env)
+    _announce(announce, secret, argv, id)
+    approve = {"op": "approve", "id": id, "signature": await sign(challenge), "environ": dict(environ)}
+    async with await anyio.connect_unix(socket) as stream:
+        await stream.send_fds(json.dumps(approve).encode() + b"\n", stdio)
+        async with anyio.create_task_group() as tasks:
+
+            async def relay() -> None:
+                with anyio.open_signal_receiver(*RELAYED) as signals:
+                    async for number in signals:
+                        await stream.send(json.dumps({"signal": int(number)}).encode() + b"\n")
+
+            tasks.start_soon(relay)
+            answer = json.loads(await Lines(stream).next())
+            tasks.cancel_scope.cancel()
+    if not answer.get("ok"):
+        raise ApprovalError(str(answer.get("error")))
+    code = int(answer["exit"])
+    # A command a signal ended exits as a shell reports it.
+    return 128 - code if code < 0 else code
+
+
+def _announce(announce: Callable[[str], None], secret: str, argv: list[str], id: str) -> None:
+    announce("touch the key to give %s to: %s (request %s)" % (secret, shlex.join(argv), id))

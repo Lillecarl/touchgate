@@ -19,7 +19,7 @@ import anyio
 from . import config
 from .approval import ApprovalError
 from .broker import Broker, ask, not_dumpable
-from .client import approved_env, ssh_sign
+from .client import approved_env, run_in_broker, ssh_sign
 
 
 async def _broker() -> int:
@@ -43,7 +43,7 @@ def _announce(line: str) -> None:
     print("touchgate: %s" % line, file=sys.stderr, flush=True)
 
 
-async def _run(secret: str, command: list[str], env: dict[str, str]) -> int:
+async def _run(secret: str, command: list[str], env: dict[str, str], client_exec: bool) -> int:
     settings = config.load()
     if settings.signing_key is None:
         raise config.ConfigError("the configuration names no `signing_key` to approve with")
@@ -51,15 +51,22 @@ async def _run(secret: str, command: list[str], env: dict[str, str]) -> int:
     if path is None:
         raise config.ConfigError("no command %r on PATH" % command[0])
     argv = [os.path.abspath(path), *command[1:]]
+    sign = functools.partial(ssh_sign, settings.signing_key)
+    requester = os.environ.get("PYMUX")
+    if not client_exec:
+        return await run_in_broker(
+            config.socket_path(),
+            secret,
+            argv,
+            sign,
+            cwd=os.getcwd(),
+            requester=requester,
+            env=env,
+            environ=os.environ,
+            announce=_announce,
+        )
     values = await approved_env(
-        config.socket_path(),
-        secret,
-        argv,
-        functools.partial(ssh_sign, settings.signing_key),
-        cwd=os.getcwd(),
-        requester=os.environ.get("PYMUX"),
-        env=env,
-        announce=_announce,
+        config.socket_path(), secret, argv, sign, cwd=os.getcwd(), requester=requester, env=env, announce=_announce
     )
     os.execve(argv[0], argv, os.environ | values)
 
@@ -100,6 +107,11 @@ def main(argv: list[str] | None = None) -> int:
         metavar="NAME=SOURCE",
         help="Also set NAME from the item's username, password, notes or a field.",
     )
+    run.add_argument(
+        "--client-exec",
+        action="store_true",
+        help="Receive the values and start the command here. The broker then cannot hold you to the command.",
+    )
     run.add_argument("secret", help="The vault item, by name or id.")
     run.add_argument("program", nargs=argparse.REMAINDER, help="-- and the command to run.")
     args = parser.parse_args(argv)
@@ -115,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
                 program: list[str] = args.program[1:] if args.program[:1] == ["--"] else args.program
                 if not program:
                     parser.error("run needs a command after --")
-                return anyio.run(_run, str(args.secret), program, dict(args.env))
+                return anyio.run(_run, str(args.secret), program, dict(args.env), bool(args.client_exec))
             case command:
                 return anyio.run(_simple, command)
     except (config.ConfigError, ApprovalError, OSError) as error:

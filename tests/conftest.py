@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
-import socket
+import socket as net
 import ssl
+import uuid
 from collections.abc import AsyncIterator
 
 import anyio
@@ -10,7 +11,13 @@ import httpx2
 import pytest
 import trustme
 
-from accounts import Server
+from accounts import Bw, Server, register
+from approving import DEADLINE, PASSWORD
+from authenticator import SoftKey
+from touchgate import config
+from touchgate.approval import APPROVERS_ITEM
+from touchgate.broker import Broker
+from touchgate.vault import Device, Endpoints
 
 #: How long vaultwarden gets to start answering.
 STARTUP = 20
@@ -22,7 +29,7 @@ def anyio_backend() -> str:
 
 
 def _free_port() -> int:
-    with socket.socket() as probe:
+    with net.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         return probe.getsockname()[1]
 
@@ -74,3 +81,32 @@ async def vaultwarden(tmp_path_factory: pytest.TempPathFactory) -> AsyncIterator
             yield server
         finally:
             process.terminate()
+
+
+@pytest.fixture(scope="module")
+def approver() -> SoftKey:
+    return SoftKey()
+
+
+@pytest.fixture(scope="module")
+async def broker(vaultwarden, tmp_path_factory, approver):
+    "One account and broker for the module: `bw` and a 600k PBKDF2 login cost seconds each."
+    account = await register(vaultwarden, "%s@example.test" % uuid.uuid4().hex[:12], PASSWORD)
+    bw = Bw(account, anyio.Path(tmp_path_factory.mktemp("bw")))
+    await bw.login()
+    await bw.create_login("database", "app", "s3cr3t", fields={"API_TOKEN": "t0ken", "not a name": "skipped"})
+    await bw.create_login(APPROVERS_ITEM, "", "", notes="# the YubiKey\n%s\nnot a key\n" % approver.line())
+    settings = config.Config(account.email, Endpoints.of(account.server.base_url))
+    broker = Broker(settings, Device(str(uuid.uuid4())), transport=account.server.transport())
+    await broker.unlock(PASSWORD)
+    return broker
+
+
+@pytest.fixture
+async def socket(broker, tmp_path):
+    path = tmp_path / "broker.sock"
+    with anyio.fail_after(DEADLINE):
+        async with anyio.create_task_group() as tasks:
+            await tasks.start(broker.serve, path)
+            yield path
+            tasks.cancel_scope.cancel()

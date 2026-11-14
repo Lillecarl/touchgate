@@ -9,59 +9,18 @@ import dataclasses
 import json
 import logging
 import os
-import uuid
 
 import anyio
 import pytest
 
-from accounts import Bw, register
+from approving import ARGV, DEADLINE, PASSWORD, signer
 from authenticator import SoftKey, plain_signature
 from touchgate import config
 from touchgate.approval import APPROVERS_ITEM, ApprovalError, ExecMode, approvers
-from touchgate.broker import Broker, ask
+from touchgate.broker import ask
 from touchgate.client import approved_env, request
 from touchgate.sshsig import SkFlags
-from touchgate.vault import Device, Endpoints, Item, Secret, Vault
-
-DEADLINE = 45
-PASSWORD = "approval password"
-ARGV = ["/usr/bin/psql", "--host", "db"]
-
-
-@pytest.fixture(scope="module")
-def approver() -> SoftKey:
-    return SoftKey()
-
-
-@pytest.fixture(scope="module")
-async def broker(vaultwarden, tmp_path_factory, approver):
-    "One account and broker for the module: `bw` and a 600k PBKDF2 login cost seconds each."
-    account = await register(vaultwarden, "%s@example.test" % uuid.uuid4().hex[:12], PASSWORD)
-    bw = Bw(account, anyio.Path(tmp_path_factory.mktemp("bw")))
-    await bw.login()
-    await bw.create_login("database", "app", "s3cr3t", fields={"API_TOKEN": "t0ken", "not a name": "skipped"})
-    await bw.create_login(APPROVERS_ITEM, "", "", notes="# the YubiKey\n%s\nnot a key\n" % approver.line())
-    settings = config.Config(account.email, Endpoints.of(account.server.base_url))
-    broker = Broker(settings, Device(str(uuid.uuid4())), transport=account.server.transport())
-    await broker.unlock(PASSWORD)
-    return broker
-
-
-@pytest.fixture
-async def socket(broker, tmp_path):
-    path = tmp_path / "broker.sock"
-    with anyio.fail_after(DEADLINE):
-        async with anyio.create_task_group() as tasks:
-            await tasks.start(broker.serve, path)
-            yield path
-            tasks.cancel_scope.cancel()
-
-
-def _signer(key: SoftKey, **options):
-    async def sign(challenge: bytes) -> str:
-        return key.sign(challenge, **options)
-
-    return sign
+from touchgate.vault import Item, Secret, Vault
 
 
 async def _ask(socket, env=None):
@@ -79,7 +38,7 @@ async def test_a_touch_releases_the_values(socket, approver):
             socket,
             "database",
             ARGV,
-            _signer(approver),
+            signer(approver),
             cwd="/srv",
             requester="%1",
             env={"PGPASSWORD": "password", "PGUSER": "username"},
@@ -97,7 +56,7 @@ async def test_the_challenge_names_the_run_and_carries_no_value(socket):
         )
     challenge = json.loads(str(reply["challenge"]))
     assert challenge["argv"] == ARGV and challenge["cwd"] == "/srv" and challenge["requester"] == "%1"
-    assert challenge["variables"] == ["API_TOKEN"] and challenge["exec"] == "client"
+    assert challenge["variables"] == ["API_TOKEN"] and challenge["exec"] == "broker"
     assert "s3cr3t" not in json.dumps(reply) and "t0ken" not in json.dumps(reply)
 
 
