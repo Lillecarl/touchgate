@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "touchgate"
+version = "0.1.0"
+description = "Run a command with secrets from a Bitwarden vault once a hardware key touch approves it"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.13"
+dependencies = [
+  "anyio>=4.10",
+  # The Argon2id KDF a Bitwarden account may use.
+  "argon2-cffi>=23.1",
+  # AES-CBC, HMAC, HKDF, PBKDF2 and RSA-OAEP of the vault.
+  "cryptography>=44",
+  "httpx2",
+  "pydantic>=2.11",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-timeout"]
+
+[project.scripts]
+touchgate = "touchgate.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/touchgate"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Every async test and fixture runs on anyio, with no mark.
+anyio_mode = "auto"
+# A hang fails instead of waiting forever. A test's own deadline is lower.
+timeout = 60
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+extend-select = ["I", "UP", "B", "TID"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"asyncio".msg = "use anyio"
