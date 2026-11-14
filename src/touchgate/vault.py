@@ -33,8 +33,11 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 __all__ = [
+    "BITWARDEN_EU",
+    "BITWARDEN_US",
     "CipherType",
     "Device",
+    "Endpoints",
     "Item",
     "LoginFailed",
     "Secret",
@@ -187,8 +190,26 @@ def _failure(response: httpx2.Response) -> LoginFailed:
     return LoginFailed("HTTP %d: %s" % (response.status_code, message or "no reason given"))
 
 
+@dataclass(frozen=True, slots=True)
+class Endpoints:
+    "Where the API and the identity service answer. Bitwarden's cloud puts them on two hosts."
+
+    api: str
+    identity: str
+
+    @classmethod
+    def of(cls, base_url: str) -> Endpoints:
+        "A self-hosted server, vaultwarden included, serves both under one base (protocol.md §0)."
+        base = base_url.rstrip("/")
+        return cls(base + "/api", base + "/identity")
+
+
+BITWARDEN_US = Endpoints("https://api.bitwarden.com", "https://identity.bitwarden.com")
+BITWARDEN_EU = Endpoints("https://api.bitwarden.eu", "https://identity.bitwarden.eu")
+
+
 async def open_vault(
-    base_url: str,
+    endpoints: Endpoints,
     email: str,
     password: str,
     device: Device,
@@ -201,15 +222,16 @@ async def open_vault(
         "Bitwarden-Client-Version": CLIENT_VERSION,
         "Device-Type": str(DEVICE_TYPE),
     }
-    async with httpx2.AsyncClient(base_url=base_url.rstrip("/"), headers=headers, transport=transport) as http:
-        prelogin = await http.post("/identity/accounts/prelogin", json={"email": email})
+    identity, api = endpoints.identity, endpoints.api
+    async with httpx2.AsyncClient(headers=headers, transport=transport) as http:
+        prelogin = await http.post(identity + "/accounts/prelogin", json={"email": email})
         prelogin.raise_for_status()
         settings = _Prelogin.model_validate(prelogin.json())
         kdf = Kdf(settings.kdf, settings.kdf_iterations, settings.kdf_memory, settings.kdf_parallelism).checked()
 
         key = master_key(password, email, kdf)
         response = await http.post(
-            "/identity/connect/token",
+            identity + "/connect/token",
             data={
                 "grant_type": "password",
                 "username": email,
@@ -232,7 +254,7 @@ async def open_vault(
         except BadMac:
             raise WrongPassword("the master password does not open the account key") from None
 
-        sync = await http.get("/api/sync", headers={"Authorization": "Bearer " + token.access_token})
+        sync = await http.get(api + "/sync", headers={"Authorization": "Bearer " + token.access_token})
         sync.raise_for_status()
         return _open(_Sync.model_validate(sync.json()), user_key, token.private_key)
 

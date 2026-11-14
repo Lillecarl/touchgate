@@ -11,7 +11,7 @@ import anyio
 import pytest
 
 from accounts import CHEAP_ARGON2, Account, Bw, register
-from touchgate.vault import Device, LoginFailed, Secret, Vault, open_vault
+from touchgate.vault import Device, Endpoints, LoginFailed, Secret, Vault, open_vault
 
 #: Registration, a bw login and a create each cost a node start and a KDF.
 DEADLINE = 45
@@ -26,7 +26,7 @@ def _email() -> str:
 async def _open(account: Account, password: str | None = None) -> Vault:
     server = account.server
     return await open_vault(
-        server.base_url, account.email, password or account.password, DEVICE, transport=server.transport()
+        Endpoints.of(server.base_url), account.email, password or account.password, DEVICE, transport=server.transport()
     )
 
 
