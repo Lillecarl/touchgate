@@ -56,7 +56,7 @@ async def test_the_challenge_names_the_run_and_carries_no_value(socket):
         )
     challenge = json.loads(str(reply["challenge"]))
     assert challenge["argv"] == ARGV and challenge["cwd"] == "/srv" and challenge["requester"] == "%1"
-    assert challenge["variables"] == ["API_TOKEN"] and challenge["exec"] == "broker"
+    assert challenge["variables"] == {"API_TOKEN": "API_TOKEN"} and challenge["exec"] == "broker"
     assert "s3cr3t" not in json.dumps(reply) and "t0ken" not in json.dumps(reply)
 
 
@@ -79,6 +79,15 @@ async def test_refused_and_used_up(socket, approver, signature, error):
         again = await _approve(socket, id, approver.sign(challenge))
     assert refused["ok"] is False and error in str(refused["error"])
     assert again["ok"] is False and "no request" in str(again["error"])
+
+
+async def test_the_challenge_says_where_each_value_comes_from(socket):
+    "Two requests that release different values never sign as the same bytes."
+    with anyio.fail_after(DEADLINE):
+        _, password = await _ask(socket, env={"X": "password"})
+        _, username = await _ask(socket, env={"X": "username"})
+    assert json.loads(password)["variables"] == {"API_TOKEN": "API_TOKEN", "X": "password"}
+    assert json.loads(username)["variables"] == {"API_TOKEN": "API_TOKEN", "X": "username"}
 
 
 async def test_a_signature_approves_one_request_once(socket, approver):
@@ -109,6 +118,10 @@ async def test_what_a_request_may_not_ask_for(socket):
             await _ask(socket, env={"X": "nothing"})
         with pytest.raises(ApprovalError, match="not a variable name"):
             await _ask(socket, env={"1X": "password"})
+        with pytest.raises(ApprovalError, match="absolute path"):
+            await request(socket, "database", ["psql"], cwd="/", requester=None, mode=ExecMode.BROKER, env={})
+        with pytest.raises(ApprovalError, match="absolute path"):
+            await request(socket, "database", ARGV, cwd="srv", requester=None, mode=ExecMode.BROKER, env={})
         with pytest.raises(ApprovalError, match="0 items"):
             await request(socket, "missing", ARGV, cwd="/", requester=None, mode=ExecMode.CLIENT, env={})
 
@@ -163,7 +176,8 @@ async def test_touchgate_run_signs_with_ssh_keygen(broker, tmp_path):
             tasks.cancel_scope.cancel()
     stderr = done.stderr.decode()
     assert done.returncode == 1, stderr
-    assert "touch the key to give database to: " in stderr and str(marker) in stderr
+    assert "touch the key to approve request" in stderr and "touch %s" % marker in stderr
+    assert "PGPASSWORD from password" in stderr and "started by the broker" in stderr
     assert "not a security key" in stderr
     assert not marker.exists()
 

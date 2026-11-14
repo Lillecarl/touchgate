@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
 import time
@@ -74,29 +75,38 @@ def approvers(vault: Vault) -> tuple[SkPublicKey, ...]:
     return tuple(keys)
 
 
-def variables(item: Item, explicit: Mapping[str, str]) -> dict[str, Secret]:
+def sources(item: Item, explicit: Mapping[str, str]) -> dict[str, str]:
     """
-    Every custom field whose name is a variable name, plus each
-    `NAME: source` in `explicit`, where a source is `username`,
-    `password`, `notes` or a field name.
+    Each variable and where its value comes from: every custom field whose
+    name is a variable name, plus each `NAME: source` in `explicit`, where
+    a source is `username`, `password`, `notes` or a field name.
     """
-    values = {name: value for name, value in item.fields.items() if ENV_NAME.match(name)}
+    chosen = {name: name for name in item.fields if ENV_NAME.match(name)}
     for name, source in explicit.items():
         if not ENV_NAME.match(name):
             raise ApprovalError("%r is not a variable name" % name)
-        match source:
-            case Source.USERNAME:
-                value = item.username
-            case Source.PASSWORD:
-                value = item.password
-            case Source.NOTES:
-                value = item.notes
-            case _:
-                value = item.fields.get(source)
-        if value is None:
-            raise ApprovalError("%r has no %s" % (item.name, source))
-        values[name] = value
-    return values
+        _value(item, source)
+        chosen[name] = source
+    return chosen
+
+
+def variables(item: Item, explicit: Mapping[str, str]) -> dict[str, Secret]:
+    return {name: _value(item, source) for name, source in sources(item, explicit).items()}
+
+
+def _value(item: Item, source: str) -> Secret:
+    match source:
+        case Source.USERNAME:
+            value = item.username
+        case Source.PASSWORD:
+            value = item.password
+        case Source.NOTES:
+            value = item.notes
+        case _:
+            value = item.fields.get(source)
+    if value is None:
+        raise ApprovalError("%r has no %s" % (item.name, source))
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +119,7 @@ class Request:
     requester: str | None
     mode: ExecMode
     explicit: Mapping[str, str]
-    names: tuple[str, ...]
+    sources: Mapping[str, str]
     expires: int
     deadline: float = field(repr=False)
     challenge: bytes = field(repr=False)
@@ -125,7 +135,7 @@ def challenge(
     cwd: str,
     requester: str | None,
     mode: ExecMode,
-    names: tuple[str, ...],
+    sources: Mapping[str, str],
 ) -> bytes:
     "What the person signs. Canonical JSON, so the same request is the same bytes."
     return json.dumps(
@@ -140,7 +150,7 @@ def challenge(
             "cwd": cwd,
             "requester": requester,
             "exec": mode,
-            "variables": list(names),
+            "variables": dict(sources),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -167,13 +177,16 @@ class Requests:
             raise ApprovalError("%d requests already wait for a touch" % MAX_PENDING)
         if not argv:
             raise ApprovalError("a request names a command")
+        # A bare name would be looked up on a PATH the client chooses, after the touch.
+        if not os.path.isabs(argv[0]) or not os.path.isabs(cwd):
+            raise ApprovalError("a request names its command and directory by absolute path")
         try:
             item = vault.find(secret)
         except KeyError as error:
             raise ApprovalError(str(error.args[0])) from None
         if item.name == APPROVERS_ITEM:
             raise ApprovalError("the approver list is not a secret to hand out")
-        names = tuple(sorted(variables(item, explicit)))
+        chosen = dict(sorted(sources(item, explicit).items()))
         id, nonce = secrets.token_hex(8), secrets.token_hex(16)
         expires = int(time.time()) + LIFETIME
         request = Request(
@@ -185,10 +198,10 @@ class Requests:
             requester=requester,
             mode=mode,
             explicit=dict(explicit),
-            names=names,
+            sources=chosen,
             expires=expires,
             deadline=time.monotonic() + LIFETIME,
-            challenge=challenge(id, nonce, expires, secret, item.id, argv, cwd, requester, mode, names),
+            challenge=challenge(id, nonce, expires, secret, item.id, argv, cwd, requester, mode, chosen),
         )
         self.pending[id] = request
         return request

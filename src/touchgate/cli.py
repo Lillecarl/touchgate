@@ -12,6 +12,7 @@ import getpass
 import logging
 import os
 import shutil
+import signal
 import sys
 
 import anyio
@@ -68,6 +69,8 @@ async def _run(secret: str, command: list[str], env: dict[str, str], client_exec
     values = await approved_env(
         config.socket_path(), secret, argv, sign, cwd=os.getcwd(), requester=requester, env=env, announce=_announce
     )
+    # Python ignores SIGPIPE, and an exec keeps an ignored signal ignored.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     os.execve(argv[0], argv, os.environ | values)
 
 

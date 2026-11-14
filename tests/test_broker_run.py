@@ -75,6 +75,31 @@ async def test_a_signal_reaches_the_command(socket, approver, stdio):
     assert answer == {"ok": True, "exit": 7}
 
 
+async def test_a_broker_run_on_a_terminal(socket, approver):
+    "A person runs this on a terminal: the command sees one, though not as its controlling terminal."
+    controller, terminal = os.openpty()
+    try:
+        with anyio.fail_after(DEADLINE):
+            code = await run_in_broker(
+                socket,
+                "database",
+                [SH, "-c", "test -t 0 && test -t 1 && echo on-a-tty"],
+                signer(approver),
+                cwd="/",
+                requester=None,
+                env={},
+                environ={},
+                announce=lambda line: None,
+                stdio=(terminal, terminal, terminal),
+            )
+            seen = await anyio.to_thread.run_sync(os.read, controller, 64)
+    finally:
+        os.close(controller)
+        os.close(terminal)
+    assert code == 0
+    assert b"on-a-tty" in seen
+
+
 async def test_a_broker_run_needs_the_stdio(socket, approver):
     with anyio.fail_after(DEADLINE):
         id, challenge = await request(socket, "database", ARGV, cwd="/", requester=None, mode=ExecMode.BROKER, env={})
