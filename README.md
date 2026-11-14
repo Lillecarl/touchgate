@@ -27,7 +27,9 @@ has seen what asks for it.
 - **Approval:** the broker builds a challenge from the secret name, the
   exact command line and the requester (the pymux pane, from `$PYMUX`).
   The person signs it with a hardware key, and the broker verifies the
-  signature itself.
+  signature itself. The challenge carries a nonce and an expiry, so a
+  captured signature does not approve a second run. An `sk` signature
+  made without user presence (no touch) is refused.
 
 ## The rule
 
