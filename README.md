@@ -18,7 +18,9 @@ has seen what asks for it.
 ## Parts
 
 - **Broker:** a user service. It holds the unlocked vault in memory and
-  listens on a unix socket.
+  listens on a unix socket. It is its own Bitwarden client: it speaks
+  the Bitwarden API and does the vault cryptography itself, with no
+  `bw` process beside it. Its tests run against Vaultwarden.
 - **`touchgate run`:** sends a request to the broker and waits. On
   approval it receives the values, sets them in the environment, and
   execs the command.
