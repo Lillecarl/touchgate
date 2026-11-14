@@ -28,6 +28,10 @@ test = ["pytest", "pytest-timeout", "trustme"]
 [project.scripts]
 touchgate = "touchgate.cli:main"
 
+# pymux loads this when touchgate is installed beside it (pymux.withPlugins).
+[project.entry-points."pymux.plugins"]
+touchgate = "touchgate.pymux_plugin"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/touchgate"]
 
@@ -39,6 +43,8 @@ pythonpath = ["tests"]
 anyio_mode = "auto"
 # A hang fails instead of waiting forever. A test's own deadline is lower.
 timeout = 60
+# A hang dumps every thread's stack before the timeout ends it.
+faulthandler_timeout = 50
 filterwarnings = ["error"]
 
 [tool.ruff]

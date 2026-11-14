@@ -1,3 +1,5 @@
 project-includes = ["src", "tests"]
 # The tests import their helpers as top-level modules, as pytest's `pythonpath` puts them.
 search-path = ["src", "tests"]
+# The pymux plugin imports pymux, which only the server that loads it has.
+ignore-missing-imports = ["pymux.*"]

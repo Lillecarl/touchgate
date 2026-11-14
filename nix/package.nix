@@ -1,6 +1,7 @@
 {
   lib,
   buildPythonPackage,
+  python,
   hatchling,
   anyio,
   argon2-cffi,
@@ -37,6 +38,14 @@ buildPythonPackage (finalAttrs: {
   ];
 
   pythonImportsCheck = [ "touchgate" ];
+
+  passthru = {
+    /**
+      The pymux plugin, one file with no dependencies beyond pymux's own.
+      Link it to `pymux/plugins/touchgate.py` under the XDG config home.
+    */
+    pymuxPlugin = "${finalAttrs.finalPackage}/${python.sitePackages}/touchgate/pymux_plugin.py";
+  };
 
   meta = {
     description = "Run a command with secrets from a Bitwarden vault once a hardware key touch approves it";

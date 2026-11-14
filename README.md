@@ -80,6 +80,22 @@ The broker starts locked. Three ways open it:
   The sealed file opens only with that key, touched. The password
   crosses the SSH link to the broker.
 
+## The pymux popup
+
+`touchgate show <id>` prints a request as the broker holds it, and
+waits until it ends. The pymux plugin runs it in a popup in the session
+of the pane that asked, for every request whose `$PYMUX` names that
+server. The plugin is one file with no dependencies beyond pymux's own:
+
+    ln -s $(python -c 'import touchgate.pymux_plugin as p; print(p.__file__)') \
+      ~/.config/pymux/plugins/touchgate.py
+
+From Nix, the package names the file as `touchgate.pymuxPlugin`:
+
+    xdg.configFile."pymux/plugins/touchgate.py".source = touchgate.pymuxPlugin;
+
+`touchgate` must be on the PATH of the pymux server.
+
 ## Configuration
 
 `~/.config/touchgate/config.toml`:
@@ -92,11 +108,11 @@ The broker starts locked. Three ways open it:
 
 - A process that receives a secret can print it. An approved
   `touchgate run db -- env` gives the value away.
-- The requesting process prints the prompt, so a changed client can
-  print one thing and ask for a signature over another. The touch binds
-  the challenge bytes, not what the person read. A display that the
-  requester does not control (the pymux plugin, a WebAuthn page) closes
-  this.
+- The requesting process prints its own prompt, so a changed client
+  can print one thing and ask for a signature over another. The touch
+  binds the challenge bytes, not what the person read. Read the request
+  in the pymux popup, which shows what the broker holds. A process that
+  drives pymux can still open a popup of its own that looks the same.
 - While an approved command runs, every process of the same user can
   read its environment from `/proc/<pid>/environ`. That is true in both
   modes.
