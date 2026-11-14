@@ -20,7 +20,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest", "pytest-timeout"]
+# trustme: the test server's TLS, since the official `bw` refuses plain HTTP.
+test = ["pytest", "pytest-timeout", "trustme"]
 
 [project.scripts]
 touchgate = "touchgate.cli:main"

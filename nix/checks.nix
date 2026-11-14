@@ -1,6 +1,7 @@
 {
   lib,
   runCommand,
+  cacert,
   python,
   touchgate,
   vaultwarden,
@@ -29,6 +30,7 @@ let
       touchgate
       ps.pytest
       ps.pytest-timeout
+      ps.trustme
     ]
   );
 
@@ -53,6 +55,8 @@ in
       ''
         cp -r ${pythonSources} src && chmod -R +w src && cd src
         export HOME=$TMPDIR
+        # httpx2 builds a TLS context even for http://, and the sandbox has no CA file.
+        export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt
         python -m pytest -p no:cacheprovider --import-mode=importlib -v ${
           if selected == "" then "tests" else selected
         }
