@@ -66,7 +66,8 @@ in
         export TOUCHGATE_SSHSIG_VECTORS=${sshsigVectors}
         # httpx2 builds a TLS context even for http://, and the sandbox has no CA file.
         export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt
-        python -m pytest -p no:cacheprovider --import-mode=importlib -v ${
+        # The whole suite takes about four minutes; a hang outside any test stops here.
+        timeout 900 python -m pytest -p no:cacheprovider --import-mode=importlib -v ${
           if selected == "" then "tests" else selected
         }
         touch $out
